@@ -19,7 +19,47 @@ import {
   readPendingRestartNotifications,
   resolveEmbeddedCodexNativeApiOptions,
   resolveClearContextAccountId,
+  runWeixinSend,
 } from '../../../src/cli.js';
+
+test('weixin send delivers a text file once for the same idempotency key', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-send-'));
+  const digestPath = path.join(tmpDir, 'digest.md');
+  const requests: Array<{ externalScopeId: string; content: string }> = [];
+  fs.writeFileSync(digestPath, '早报正文\n第二行', 'utf8');
+
+  const args = [
+    '--state-dir', tmpDir,
+    '--to-user-id', 'melody@im.wechat',
+    '--text-file', digestPath,
+    '--idempotency-key', 'linear-digest-2026-07-31',
+  ];
+  const dependencies = {
+    createPlatformPlugin: () => ({
+      async start() {},
+      async stop() {},
+      async sendText(request: { externalScopeId: string; content: string }) {
+        requests.push(request);
+        return {
+          success: true,
+          deliveredCount: 1,
+          deliveredText: request.content,
+          failedIndex: null,
+          failedText: '',
+          error: '',
+          errorCode: null,
+        };
+      },
+    }),
+  };
+
+  await runWeixinSend(args, dependencies);
+  await runWeixinSend(args, dependencies);
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.externalScopeId, 'melody@im.wechat');
+  assert.equal(requests[0]?.content, '早报正文\n第二行');
+});
 
 test('parseWeixinLoginArgs reads supported CLI flags', () => {
   const parsed = parseWeixinLoginArgs([

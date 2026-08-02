@@ -35,6 +35,29 @@ interface WeixinServeArgs {
   cwd: string | null;
 }
 
+interface WeixinSendArgs {
+  stateDir: string | null;
+  toUserId: string | null;
+  textFile: string | null;
+  idempotencyKey: string | null;
+}
+
+interface WeixinSendPlatformPlugin {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  sendText(params: {
+    externalScopeId: string;
+    content: string;
+  }): Promise<{
+    success: boolean;
+    error?: string | null;
+  } | null | undefined>;
+}
+
+interface WeixinSendDependencies {
+  createPlatformPlugin?: (stateDir: string) => WeixinSendPlatformPlugin;
+}
+
 interface WeixinClearContextArgs {
   stateDir: string | null;
   accountId: string | null;
@@ -94,6 +117,9 @@ async function main(argv: string[] = process.argv.slice(2)) {
   }
   if (group === 'weixin' && command === 'serve') {
     return runWeixinServe(args);
+  }
+  if (group === 'weixin' && command === 'send') {
+    return runWeixinSend(args);
   }
   if (group === 'weixin' && command === 'clear-context') {
     return runWeixinClearContext(args);
@@ -194,6 +220,62 @@ async function runWeixinClearContext(args: string[]) {
   clearContextTokensForAccount(accountsDir, accountId);
   process.stdout.write(`${i18n.t('cli.clearContext.success')}\n`);
   process.stdout.write(`${i18n.t('cli.clearContext.account', { value: accountId })}\n`);
+}
+
+async function runWeixinSend(
+  args: string[],
+  dependencies: WeixinSendDependencies = {},
+) {
+  const i18n = createI18n();
+  const options = parseWeixinSendArgs(args);
+  if (!options.toUserId || !options.textFile || !options.idempotencyKey) {
+    throw new Error(i18n.t('cli.send.requiredArgs'));
+  }
+
+  const stateDir = path.resolve(options.stateDir ?? defaultCodexBridgeStateDir());
+  const textFile = path.resolve(options.textFile);
+  const content = await fsp.readFile(textFile, 'utf8');
+  if (!content.trim()) {
+    throw new Error(i18n.t('cli.send.emptyTextFile', { textFile }));
+  }
+
+  const receiptsFile = path.join(stateDir, 'runtime', 'weixin-outbound-receipts.json');
+  const receiptKey = `${options.toUserId}:${options.idempotencyKey}`;
+  const receipts = readWeixinOutboundReceipts(receiptsFile);
+  if (receipts[receiptKey]) {
+    process.stdout.write(`${i18n.t('cli.send.skipped', { idempotencyKey: options.idempotencyKey })}\n`);
+    return;
+  }
+
+  const platformPlugin = dependencies.createPlatformPlugin?.(stateDir) ?? new WeixinPlatformPlugin({
+    accountStore: new WeixinAccountStore({
+      rootDir: path.join(stateDir, 'weixin', 'accounts'),
+    }),
+  });
+  await platformPlugin.start();
+  try {
+    const result = await platformPlugin.sendText({
+      externalScopeId: options.toUserId,
+      content,
+    });
+    if (!result?.success) {
+      throw new Error(i18n.t('cli.send.failed', {
+        error: result?.error || 'unknown error',
+      }));
+    }
+  } finally {
+    await platformPlugin.stop();
+  }
+
+  await writeWeixinOutboundReceipts(receiptsFile, {
+    ...receipts,
+    [receiptKey]: {
+      sentAt: new Date().toISOString(),
+      textFile,
+      toUserId: options.toUserId,
+    },
+  });
+  process.stdout.write(`${i18n.t('cli.send.success')}\n`);
 }
 
 async function runWeixinServe(args: string[]) {
@@ -548,6 +630,39 @@ function parseWeixinServeArgs(args: string[]): WeixinServeArgs {
     }
     if (arg === '--cwd' && next) {
       options.cwd = next;
+      index += 1;
+    }
+  }
+  return options;
+}
+
+function parseWeixinSendArgs(args: string[]): WeixinSendArgs {
+  const options: WeixinSendArgs = {
+    stateDir: null,
+    toUserId: null,
+    textFile: null,
+    idempotencyKey: null,
+  };
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    const next = args[index + 1];
+    if (arg === '--state-dir' && next) {
+      options.stateDir = next;
+      index += 1;
+      continue;
+    }
+    if (arg === '--to-user-id' && next) {
+      options.toUserId = next;
+      index += 1;
+      continue;
+    }
+    if (arg === '--text-file' && next) {
+      options.textFile = next;
+      index += 1;
+      continue;
+    }
+    if (arg === '--idempotency-key' && next) {
+      options.idempotencyKey = next;
       index += 1;
     }
   }
@@ -949,9 +1064,40 @@ function printUsage() {
     createI18n().t('cli.usage.login'),
     createI18n().t('cli.usage.clearContext'),
     createI18n().t('cli.usage.serve'),
+    createI18n().t('cli.usage.send'),
     createI18n().t('cli.usage.cleanupInternalThreads'),
     createI18n().t('cli.usage.nativeApiServe'),
   ].join('\n'));
+}
+
+function readWeixinOutboundReceipts(filePath: string): Record<string, {
+  sentAt: string;
+  textFile: string;
+  toUserId: string;
+}> {
+  if (!fs.existsSync(filePath)) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeWeixinOutboundReceipts(
+  filePath: string,
+  receipts: Record<string, {
+    sentAt: string;
+    textFile: string;
+    toUserId: string;
+  }>,
+) {
+  await fsp.mkdir(path.dirname(filePath), { recursive: true });
+  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  await fsp.writeFile(temporaryPath, `${JSON.stringify(receipts, null, 2)}\n`, 'utf8');
+  await fsp.rename(temporaryPath, filePath);
 }
 
 function resolveClearContextAccountId({
@@ -1113,7 +1259,9 @@ export {
   resolveEmbeddedCodexNativeApiOptions,
   parseWeixinClearContextArgs,
   parseWeixinLoginArgs,
+  parseWeixinSendArgs,
   parseWeixinServeArgs,
   readPendingRestartNotifications,
   resolveClearContextAccountId,
+  runWeixinSend,
 };
