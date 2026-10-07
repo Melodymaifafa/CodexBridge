@@ -1,0 +1,41 @@
+# 跨系统测试。接入共享自动化时，调用桩的 ci.yml 和本仓库原来那份 CI 同名，把它整个
+# 盖掉了，于是测试只剩 Linux 一个系统（MEL-322）。CodexBridge 本身就是个 Windows
+# 工具，Windows 覆盖是当初特意加的，这一份把它补回来。
+#
+# 只留 Windows：Linux 那一份共享的 ci.yml 已经在跑同样这三步，再跑一遍不多一条信息。
+# 合并闸门只要求「有检查且全绿」，不挑名字，所以这个文件和调用桩可以并存。
+name: Cross-OS tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run isolated test suite
+        run: npm test

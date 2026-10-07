@@ -146,10 +146,10 @@ test('web_search executor rejects offline mode when only live providers are conf
   });
 
   await assert.rejects(
-    executor(baseRequest({
+    Promise.resolve(executor(baseRequest({
       query: 'offline query',
       external_web_access: false,
-    })),
+    }))),
     /external_web_access=false requires a cache\/offline source/u,
   );
   assert.equal(called, false);

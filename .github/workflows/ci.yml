@@ -10,5 +10,5 @@ jobs:
     uses: Melodymaifafa/gh-workflows/.github/workflows/ci.yml@v1
     with:
       runtime: node
-      lint_cmd: 'skip'
+      lint_cmd: 'npm run typecheck'
       node_version: '24'
