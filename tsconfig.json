@@ -14,7 +14,10 @@
     "resolveJsonModule": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node"]
+    "types": ["node"],
+    "paths": {
+      "@codex-provider/core": ["./packages/codex-provider-relay/src/index.ts"]
+    }
   },
   "include": [
     "packages/**/*.ts",

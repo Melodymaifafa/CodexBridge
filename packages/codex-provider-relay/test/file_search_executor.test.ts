@@ -960,10 +960,10 @@ test('local-vector file_search rejects path_glob outside configured roots', asyn
   });
 
   await assert.rejects(
-    executor(baseRequest({
+    Promise.resolve(executor(baseRequest({
       query: 'invoice payment',
       path_glob: '../*',
-    })),
+    }))),
     /path_glob must stay inside configured roots/u,
   );
 });
@@ -1152,7 +1152,7 @@ test('local-vector indexing fails when embedding provider returns fewer embeddin
   });
 
   await assert.rejects(
-    executor(baseRequest({ query: 'invoice payment' })),
+    Promise.resolve(executor(baseRequest({ query: 'invoice payment' }))),
     /returned \d+ embeddings for \d+ inputs/u,
   );
 });
@@ -1195,7 +1195,7 @@ test('local-vector indexing fails when embedding dimensions are inconsistent', a
   });
 
   await assert.rejects(
-    executor(baseRequest({ query: 'invoice payment' })),
+    Promise.resolve(executor(baseRequest({ query: 'invoice payment' }))),
     /embedding dimension 3 at index 1; expected 2/u,
   );
 });
@@ -1313,7 +1313,7 @@ test('local-vector index store exposes documents and prefers searchChunks when a
     query: 'invoice payment',
   }));
   const content = result.content as CodexProviderRelayFileSearchExecutorContent;
-  const listedDocuments = backingStore.listDocuments?.('search-pref') ?? [];
+  const listedDocuments = (await backingStore.listDocuments?.('search-pref')) ?? [];
 
   assert.equal(content.data[0].filename, 'invoice.md');
   assert.equal(searchChunksCalls, 1);
@@ -1328,8 +1328,8 @@ test('local-vector search skips stored chunks with mismatched embedding dimensio
   const backingStore = createCodexProviderRelayMemoryLocalVectorIndexStore();
   const store = {
     ...backingStore,
-    searchChunks(request: any) {
-      return backingStore.listChunks(request.sourceName).map((chunk) => ({
+    async searchChunks(request: any) {
+      return (await backingStore.listChunks(request.sourceName)).map((chunk) => ({
         ...chunk,
         embedding: [1, 0, 0],
       }));

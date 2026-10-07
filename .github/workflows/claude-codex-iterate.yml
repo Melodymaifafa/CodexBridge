@@ -17,6 +17,10 @@ jobs:
     uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@v1
     with:
       runtime: node
+      # 修复那一轮用哪个 node。不写就是 20，跟 ci.yml 的默认值一样。**ci.yml 里钉过
+      # node_version 的仓库这里必须钉成同一个值**，否则 CI 绿着、修复那一轮装不上依赖
+      # 必然红（MEL-322，CodexBridge 1 号 PR 就是这么停住的）。onboard.sh 会把两处一起写出来。
+      node_version: '24'
       # 谁来修 PR：auto（默认，Claude 先上，撞额度才换 Codex）、claude、codex。
       # 不写就是 auto，行为和加这行之前完全一样。
       # review_fixer: auto
@@ -44,7 +48,7 @@ jobs:
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
         )
         (
-          echo "::notice::lint skipped by caller"
+          npm run typecheck
         )
         (
           npm run test --if-present
