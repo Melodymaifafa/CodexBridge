@@ -1,0 +1,46 @@
+name: Fast-forward main
+
+on:
+  # 每月 1 号和 15 号 09:00（北京时间）自动跑一次 —— 约每两周，跟分支标准一致。
+  # 闸门是 CI：develop 最新 commit 不全绿就跳过、推一条手机通知，不硬挪。
+  schedule:
+    - cron: "0 1 1,15 * *"
+  # 手动：仓库 → Actions → Fast-forward main → Run workflow。
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 拿哪个分支的位置
+        type: string
+        default: develop
+      target:
+        description: 要挪的分支
+        type: string
+        default: main
+      min_age_days:
+        description: 只挪到在 develop 上待够这么多天的 commit（填 0 = 直接追到最新）
+        type: string
+        default: "7"
+      require_green:
+        description: CI 必须全绿才挪（取消勾选可强行挪）
+        type: boolean
+        default: true
+      dry_run:
+        description: 只看会发生什么，不真的挪
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  checks: read
+
+jobs:
+  fast-forward:
+    # schedule 事件不带 inputs，取到的是空值，所以这里补默认。
+    uses: Melodymaifafa/gh-workflows/.github/workflows/ff-main.yml@v1
+    with:
+      source: ${{ inputs.source || 'develop' }}
+      target: ${{ inputs.target || 'main' }}
+      min_age_days: ${{ fromJSON(inputs.min_age_days || '7') }}
+      require_green: ${{ inputs.require_green != false }}
+      dry_run: ${{ inputs.dry_run == true }}
+    secrets: inherit

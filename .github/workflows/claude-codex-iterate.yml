@@ -1,0 +1,70 @@
+name: Claude iterates on Codex review
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+# 调用方必须声明权限：可复用工作流只能收窄，不能放宽 caller 给的权限。
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+
+jobs:
+  iterate:
+    uses: Melodymaifafa/gh-workflows/.github/workflows/claude-codex-iterate.yml@v1
+    with:
+      runtime: node
+      # 谁来修 PR：auto（默认，Claude 先上，撞额度才换 Codex）、claude、codex。
+      # 不写就是 auto，行为和加这行之前完全一样。
+      # review_fixer: auto
+      #
+      # Claude 修复用哪个模型、想多深。默认 claude-opus-5-5 + xhigh；只认明确写出的 Opus 及以上
+      # （opus / fable 别名或 claude-opus-* 这类 id，其余整轮直接红）。每条总结评论末尾会写出实际跑的模型。
+      # claude_model: claude-opus-5-5
+      # claude_effort: xhigh
+      #
+      # 修复那一轮推之前要跑的验证命令（一行一条）。不写就用中央仓库按 runtime 的
+      # 默认值，那份默认值跟 ci.yml 的默认值逐字一样。
+      # **ci.yml 里用 install_cmd / lint_cmd / test_cmd 覆盖过默认值的仓库，这里必须
+      # 跟着覆盖成同样那三条**，否则 CI 绿着、修复那一轮必然红（MEL-293 / MEL-303）：
+      # 验证命令跑的是仓库自己装不上的那套默认命令。onboard.sh 在 INSTALL_CMD /
+      # LINT_CMD / TEST_CMD 任意一个有值时会把这一段自动写出来，手改 ci.yml 的覆盖值
+      # 时要记得一起改这里。整份替换，不是逐行合并：写了就得把三条都写齐。
+      # 整块是当一个脚本跑的，不像 ci.yml 那样每条一个 step：哪条带 cd 或 exit，
+      # 就把它单独用一对独占一行的 ( ) 括起来，免得带到后面几条（onboard.sh 写出来的就是这样）。
+      # verify_cmd: |
+      #   uv sync --dev
+      #   uv run ruff check .
+      #   uv run pytest
+      verify_cmd: |
+        (
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+        )
+        (
+          echo "::notice::lint skipped by caller"
+        )
+        (
+          npm run test --if-present
+        )
+      #
+      # 允许验证命令重写哪些被跟踪的文件（一行一个，精确路径）。默认一个都不许：
+      # 验证命令来自被审的那个 PR，它改过的被跟踪文件会跟着修复一起提交推送。
+      # 验证会重新生成 lock 文件的仓库（python 的 uv sync --dev 重写 uv.lock、
+      # node 的 npm ci 重写 package-lock.json）必须在这里列出来，否则整轮红着停下。
+      # 这份清单只从调用方默认分支上的这个文件读，被审 PR 改不到它。
+      # verify_writable_paths: |
+      #   uv.lock
+      #
+      # 验证命令归谁跑：auto（默认，换一个专用的无权限账号，读不到我们的进程环境）、
+      # off（留在 runner 用户下）。缓存会变冷；验证命令真需要 runner 用户的 $HOME 或
+      # 工作区归属时才填 off。
+      # verify_isolation: auto
+      #
+      # 修几轮：修满 max_fix_rounds（默认 5）还有意见，Claude 判剩下的拦不拦合并；
+      # 确认还有真 bug 就只修那几条，最多修到 max_confirmed_fix_rounds（默认 10）轮，之后停下推通知。
+      # max_fix_rounds: 5
+      # max_confirmed_fix_rounds: 10
+    secrets: inherit
