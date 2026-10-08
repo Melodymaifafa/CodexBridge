@@ -299,6 +299,65 @@ test('weixin send keeps the key tied to its text when the first segment fails un
   assert.equal(clientIdSeeds[1], clientIdSeeds[0]);
 });
 
+test('weixin send ties the key to its text before the first segment goes out', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-send-killed-'));
+  const digestPath = path.join(tmpDir, 'digest.md');
+  const delivered: string[] = [];
+  const original = ['第一段', '第二段'].join(CHUNK_SEPARATOR);
+  fs.writeFileSync(digestPath, original, 'utf8');
+
+  const args = [
+    '--state-dir', tmpDir,
+    '--to-user-id', 'melody@im.wechat',
+    '--text-file', digestPath,
+    '--idempotency-key', 'linear-digest-2026-10-14',
+  ];
+  const receiptKey = 'melody@im.wechat:linear-digest-2026-10-14';
+  const clientIdSeeds: Array<string | undefined> = [];
+  const receiptsSeenBySend: Array<{ status?: string; deliveredDeliveryCount?: number; contentSha256?: string }> = [];
+
+  // Weixin takes the first segment, then the run dies before the send returns,
+  // so nothing written after the send would ever reach disk.
+  await assert.rejects(() => runWeixinSend(args, {
+    createPlatformPlugin: () => ({
+      async start() {},
+      async stop() {},
+      planTextDeliveries: (content: string) => content.split(CHUNK_SEPARATOR),
+      async sendText({ content, clientIdSeed }: { externalScopeId: string; content: string; clientIdSeed?: string }) {
+        clientIdSeeds.push(clientIdSeed);
+        receiptsSeenBySend.push(weixinSendReceipts(tmpDir)[receiptKey]);
+        delivered.push(content.split(CHUNK_SEPARATOR)[0]);
+        throw new Error('process killed');
+      },
+    }),
+  }), /process killed/);
+
+  assert.equal(receiptsSeenBySend.length, 1);
+  assert.equal(receiptsSeenBySend[0]?.status, 'partial');
+  assert.equal(receiptsSeenBySend[0]?.deliveredDeliveryCount, 0);
+  assert.equal(
+    receiptsSeenBySend[0]?.contentSha256,
+    crypto.createHash('sha256').update(original).digest('hex'),
+  );
+
+  // A regenerated file would go out under fresh client ids next to the first
+  // segment that already arrived.
+  fs.writeFileSync(digestPath, ['新第一段', '新第二段'].join(CHUNK_SEPARATOR), 'utf8');
+  await assert.rejects(() => runWeixinSend(args, {
+    createPlatformPlugin: weixinSendTestPlugin({ delivered, clientIdSeeds }),
+  }), /idempotency key|幂等键/);
+  assert.deepEqual(delivered, ['第一段']);
+
+  // The original text goes out again under the client ids of the killed run.
+  fs.writeFileSync(digestPath, original, 'utf8');
+  await runWeixinSend(args, {
+    createPlatformPlugin: weixinSendTestPlugin({ delivered, clientIdSeeds }),
+  });
+  assert.equal(clientIdSeeds.length, 2);
+  assert.equal(clientIdSeeds[1], clientIdSeeds[0]);
+  assert.equal(weixinSendReceipts(tmpDir)[receiptKey].status, 'sent');
+});
+
 test('weixin send leaves the key free when the send is refused before any segment goes out', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-send-refused-'));
   const digestPath = path.join(tmpDir, 'digest.md');
@@ -316,7 +375,7 @@ test('weixin send leaves the key free when the send is refused before any segmen
   };
 
   await assert.rejects(() => runWeixinSend(args, dependencies), /session paused/);
-  assert.equal(fs.existsSync(path.join(tmpDir, 'runtime', 'weixin-outbound-receipts.json')), false);
+  assert.equal(weixinSendReceipts(tmpDir)['melody@im.wechat:linear-digest-2026-10-13'], undefined);
 
   // Nothing reached Weixin, so a regenerated file may still use the key.
   fs.writeFileSync(digestPath, '更新后的早报正文', 'utf8');

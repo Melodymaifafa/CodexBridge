@@ -445,7 +445,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
       };
     }
     // The refusals above leave totalDeliveryCount out: nothing went on the wire,
-    // and the send CLI relies on that to leave the idempotency key unclaimed.
+    // and the send CLI relies on that to hand the idempotency key back.
     const deliveries = this.buildTextDeliveries({
       externalScopeId,
       content,

@@ -341,6 +341,30 @@ async function runWeixinSend(
         })}\n`);
       }
 
+      const saveReceipt = (progress: Pick<WeixinOutboundReceipt, 'status' | 'deliveredDeliveryCount' | 'totalDeliveryCount'>) => (
+        writeWeixinOutboundReceipts(receiptsFile, {
+          ...receipts,
+          [receiptKey]: {
+            sentAt: new Date().toISOString(),
+            textFile,
+            toUserId,
+            ...progress,
+            contentSha256,
+            deliveryPlanSha256,
+          },
+        })
+      );
+      // Tie the key to this text and this split before any segment goes out.
+      // Written only once the send returned, a run killed (or unable to write)
+      // after Weixin accepted a segment would leave no receipt, and a
+      // regenerated file under the same key would then go out under fresh
+      // client ids next to what already arrived.
+      await saveReceipt({
+        status: 'partial',
+        deliveredDeliveryCount: alreadyDelivered,
+        totalDeliveryCount: plannedTexts.length,
+      });
+
       // Segment client ids come from the key and the text rather than at random.
       // A segment Weixin accepted but whose reply timed out is not counted as
       // delivered, so the next run sends it again; with the same id as before
@@ -351,37 +375,34 @@ async function runWeixinSend(
         skipDeliveryCount: alreadyDelivered,
         clientIdSeed: `${receiptKey}\n${contentSha256}`,
       });
-      const deliveredTotal = alreadyDelivered
-        + Math.max(0, Math.trunc(Number(result?.deliveredCount ?? 0)));
-      const saveReceipt = (status: 'sent' | 'partial') => writeWeixinOutboundReceipts(receiptsFile, {
-        ...receipts,
-        [receiptKey]: {
-          sentAt: new Date().toISOString(),
-          textFile,
-          toUserId,
-          status,
-          deliveredDeliveryCount: deliveredTotal,
-          totalDeliveryCount: result?.totalDeliveryCount,
-          contentSha256,
-          deliveryPlanSha256,
-        },
-      });
+      const deliveredNow = Math.max(0, Math.trunc(Number(result?.deliveredCount ?? 0)));
+      const deliveredTotal = alreadyDelivered + deliveredNow;
 
       if (!result?.success) {
         // A segment Weixin accepted but never confirmed is not counted, so a run
         // can fail with nothing confirmed yet a segment already on the
-        // recipient's phone. Keep the receipt as soon as sending reached the
-        // segments, so a retry under this key stays tied to this text and this
+        // recipient's phone. Once sending reached the segments the receipt
+        // stays, so a retry under this key stays tied to this text and this
         // split. A refusal before that (not started, session paused) put
-        // nothing on the wire and leaves the key free.
-        if (deliveredTotal > 0 || typeof result?.totalDeliveryCount === 'number') {
-          await saveReceipt('partial');
+        // nothing on the wire, so the key goes back to how this run found it.
+        if (deliveredNow > 0 || typeof result?.totalDeliveryCount === 'number') {
+          await saveReceipt({
+            status: 'partial',
+            deliveredDeliveryCount: deliveredTotal,
+            totalDeliveryCount: result?.totalDeliveryCount,
+          });
+        } else {
+          await writeWeixinOutboundReceipts(receiptsFile, receipts);
         }
         throw new Error(i18n.t('cli.send.failed', {
           error: result?.error || 'unknown error',
         }));
       }
-      await saveReceipt('sent');
+      await saveReceipt({
+        status: 'sent',
+        deliveredDeliveryCount: deliveredTotal,
+        totalDeliveryCount: result.totalDeliveryCount,
+      });
     } finally {
       await platformPlugin.stop();
     }
