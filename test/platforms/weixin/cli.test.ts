@@ -33,16 +33,21 @@ function weixinSendTestPlugin({
   failOnDeliveryIndex = null,
   sendDelayMs = 0,
   clientIdSeeds = [],
+  splitContent = (content: string) => content.split(CHUNK_SEPARATOR),
 }: {
   delivered: string[];
   failOnDeliveryIndex?: number | null;
   sendDelayMs?: number;
   clientIdSeeds?: Array<string | undefined>;
+  splitContent?: (content: string) => string[];
 }) {
   const failedOnce = new Set<number>();
   return () => ({
     async start() {},
     async stop() {},
+    planTextDeliveries(content: string) {
+      return splitContent(content);
+    },
     async sendText({ content, skipDeliveryCount = 0, clientIdSeed }: {
       externalScopeId: string;
       content: string;
@@ -50,7 +55,7 @@ function weixinSendTestPlugin({
       clientIdSeed?: string;
     }) {
       clientIdSeeds.push(clientIdSeed);
-      const chunks = content.split(CHUNK_SEPARATOR);
+      const chunks = splitContent(content);
       if (sendDelayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, sendDelayMs));
       }
@@ -202,6 +207,60 @@ test('weixin send refuses to resume a partial delivery once the text file has ch
 
   assert.deepEqual(delivered, ['第一段']);
   assert.equal(weixinSendReceipts(tmpDir)['melody@im.wechat:linear-digest-2026-10-09'].status, 'partial');
+});
+
+test('weixin send refuses to resume a partial delivery once the same text splits differently', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-send-resplit-'));
+  const digestPath = path.join(tmpDir, 'digest.md');
+  const delivered: string[] = [];
+  fs.writeFileSync(digestPath, ['第一段', '第二段', '第三段'].join(CHUNK_SEPARATOR), 'utf8');
+
+  const args = [
+    '--state-dir', tmpDir,
+    '--to-user-id', 'melody@im.wechat',
+    '--text-file', digestPath,
+    '--idempotency-key', 'linear-digest-2026-10-10',
+  ];
+
+  await assert.rejects(() => runWeixinSend(args, {
+    createPlatformPlugin: weixinSendTestPlugin({ delivered, failOnDeliveryIndex: 1 }),
+  }), /transport unavailable/);
+  assert.deepEqual(delivered, ['第一段']);
+
+  // Same file, but a raised length limit now packs the first two segments into
+  // one. Skipping one segment of this split would drop 第二段 for good.
+  await assert.rejects(() => runWeixinSend(args, {
+    createPlatformPlugin: weixinSendTestPlugin({
+      delivered,
+      splitContent: (content) => {
+        const [first, second, ...rest] = content.split(CHUNK_SEPARATOR);
+        return [`${first}${CHUNK_SEPARATOR}${second}`, ...rest];
+      },
+    }),
+  }), /idempotency key|幂等键/);
+
+  assert.deepEqual(delivered, ['第一段']);
+  assert.equal(weixinSendReceipts(tmpDir)['melody@im.wechat:linear-digest-2026-10-10'].status, 'partial');
+});
+
+test('weixin send refuses a text file that formats down to nothing', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-send-blank-'));
+  const digestPath = path.join(tmpDir, 'digest.md');
+  const delivered: string[] = [];
+  fs.writeFileSync(digestPath, '![封面](https://example.com/cover.png)', 'utf8');
+
+  // Formatting strips image markup, leaving no segment to send.
+  await assert.rejects(() => runWeixinSend([
+    '--state-dir', tmpDir,
+    '--to-user-id', 'melody@im.wechat',
+    '--text-file', digestPath,
+    '--idempotency-key', 'linear-digest-2026-10-11',
+  ], {
+    createPlatformPlugin: weixinSendTestPlugin({ delivered, splitContent: () => [] }),
+  }), /digest\.md/);
+
+  assert.deepEqual(delivered, []);
+  assert.equal(fs.existsSync(path.join(tmpDir, 'runtime', 'weixin-outbound-receipts.json')), false);
 });
 
 test('weixin send treats a receipt written before chunk tracking as fully sent', async () => {

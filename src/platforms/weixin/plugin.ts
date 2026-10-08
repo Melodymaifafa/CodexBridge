@@ -239,13 +239,18 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
     };
   }
 
+  /** The segment texts sendText sends for this content, in order. */
+  planTextDeliveries(content: string): string[] {
+    return splitWeixinText(formatWeixinText(content), this.config.maxMessageLength);
+  }
+
   buildTextDeliveries({ externalScopeId, content, clientIdSeed = null }: {
     externalScopeId: string;
     content: string;
     clientIdSeed?: string | null;
   }): WeixinTextDelivery[] {
     const contextToken = getStoredContextToken(this.config.accountsDir, this.config.accountId, externalScopeId);
-    return splitWeixinText(formatWeixinText(content), this.config.maxMessageLength).map((text, index) => ({
+    return this.planTextDeliveries(content).map((text, index) => ({
       kind: 'weixin.sendmessage',
       payload: buildTextMessageReq({
         to: externalScopeId,

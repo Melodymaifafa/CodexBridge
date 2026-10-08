@@ -46,6 +46,8 @@ interface WeixinSendArgs {
 interface WeixinSendPlatformPlugin {
   start(): Promise<void>;
   stop(): Promise<void>;
+  /** The segment texts sendText sends for this content, in order. */
+  planTextDeliveries(content: string): string[];
   sendText(params: {
     externalScopeId: string;
     content: string;
@@ -69,6 +71,8 @@ interface WeixinOutboundReceipt {
   totalDeliveryCount?: number;
   /** SHA-256 of the text the delivery counts refer to. */
   contentSha256?: string;
+  /** SHA-256 of the segment texts that text was split into. */
+  deliveryPlanSha256?: string;
 }
 
 interface WeixinSendDependencies {
@@ -286,17 +290,6 @@ async function runWeixinSend(
       process.stdout.write(`${i18n.t('cli.send.skipped', { idempotencyKey })}\n`);
       return;
     }
-    // A partial receipt counts segments of the text it was written for. Applied
-    // to an edited or regenerated file it would skip the wrong segments and
-    // splice the old beginning onto the new ending, so only the same text may
-    // resume it.
-    if (receipt && receipt.contentSha256 !== contentSha256) {
-      throw new Error(i18n.t('cli.send.partialContentChanged', {
-        idempotencyKey,
-        deliveredDeliveryCount: Math.max(0, Math.trunc(Number(receipt.deliveredDeliveryCount ?? 0))),
-      }));
-    }
-
     // A long message goes out in several segments. When an earlier run got part
     // way through, skip exactly that many segments so the delivered ones are
     // never sent twice. The offset travels with the FULL text: segment
@@ -304,10 +297,15 @@ async function runWeixinSend(
     // same content, and re-splitting a single segment can reformat it (a
     // segment that starts inside a code fence loses the fence).
     const alreadyDelivered = Math.max(0, Math.trunc(Number(receipt?.deliveredDeliveryCount ?? 0)));
-    if (alreadyDelivered > 0) {
-      process.stdout.write(`${i18n.t('cli.send.resumed', {
+    // A partial receipt counts segments of the text it was written for. Applied
+    // to an edited or regenerated file it would skip the wrong segments and
+    // splice the old beginning onto the new ending, so only the same text may
+    // resume it.
+    if (receipt && receipt.contentSha256 !== contentSha256) {
+      throw new Error(i18n.t('cli.send.partialContentChanged', {
+        idempotencyKey,
         deliveredDeliveryCount: alreadyDelivered,
-      })}\n`);
+      }));
     }
 
     const platformPlugin = dependencies.createPlatformPlugin?.(stateDir) ?? new WeixinPlatformPlugin({
@@ -317,6 +315,31 @@ async function runWeixinSend(
     });
     await platformPlugin.start();
     try {
+      // Formatting drops what Weixin cannot carry, so a file holding nothing
+      // else (only an image, say) splits into no segments at all. Sending it
+      // would report success and use up the key with nothing delivered.
+      const plannedTexts = platformPlugin.planTextDeliveries(content);
+      if (plannedTexts.length === 0) {
+        throw new Error(i18n.t('cli.send.nothingToSend', { textFile }));
+      }
+      // The split also depends on settings such as the message length limit,
+      // so the same text can come out in different segments after a change.
+      // The skipped count only means anything against the split it counted.
+      const deliveryPlanSha256 = crypto.createHash('sha256')
+        .update(JSON.stringify(plannedTexts))
+        .digest('hex');
+      if (receipt && receipt.deliveryPlanSha256 !== deliveryPlanSha256) {
+        throw new Error(i18n.t('cli.send.partialPlanChanged', {
+          idempotencyKey,
+          deliveredDeliveryCount: alreadyDelivered,
+        }));
+      }
+      if (alreadyDelivered > 0) {
+        process.stdout.write(`${i18n.t('cli.send.resumed', {
+          deliveredDeliveryCount: alreadyDelivered,
+        })}\n`);
+      }
+
       // Segment client ids come from the key and the text rather than at random.
       // A segment Weixin accepted but whose reply timed out is not counted as
       // delivered, so the next run sends it again; with the same id as before
@@ -339,6 +362,7 @@ async function runWeixinSend(
           deliveredDeliveryCount: deliveredTotal,
           totalDeliveryCount: result?.totalDeliveryCount,
           contentSha256,
+          deliveryPlanSha256,
         },
       });
 
