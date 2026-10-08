@@ -31,17 +31,20 @@ const CHUNK_SEPARATOR = '\n---\n';
 function weixinSendTestPlugin({
   delivered,
   failOnDeliveryIndex = null,
+  refuseOnce = false,
   sendDelayMs = 0,
   clientIdSeeds = [],
   splitContent = (content: string) => content.split(CHUNK_SEPARATOR),
 }: {
   delivered: string[];
   failOnDeliveryIndex?: number | null;
+  refuseOnce?: boolean;
   sendDelayMs?: number;
   clientIdSeeds?: Array<string | undefined>;
   splitContent?: (content: string) => string[];
 }) {
   const failedOnce = new Set<number>();
+  let refused = false;
   return () => ({
     async start() {},
     async stop() {},
@@ -55,6 +58,20 @@ function weixinSendTestPlugin({
       clientIdSeed?: string;
     }) {
       clientIdSeeds.push(clientIdSeed);
+      // Like the real plugin with a paused session: turned away before any
+      // segment goes out, so no segment total is reported.
+      if (refuseOnce && !refused) {
+        refused = true;
+        return {
+          success: false,
+          deliveredCount: 0,
+          deliveredText: '',
+          failedIndex: 0,
+          failedText: content,
+          error: 'session paused',
+          errorCode: null,
+        };
+      }
       const chunks = splitContent(content);
       if (sendDelayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, sendDelayMs));
@@ -241,6 +258,70 @@ test('weixin send refuses to resume a partial delivery once the same text splits
 
   assert.deepEqual(delivered, ['第一段']);
   assert.equal(weixinSendReceipts(tmpDir)['melody@im.wechat:linear-digest-2026-10-10'].status, 'partial');
+});
+
+test('weixin send keeps the key tied to its text when the first segment fails unconfirmed', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-send-unconfirmed-'));
+  const digestPath = path.join(tmpDir, 'digest.md');
+  const delivered: string[] = [];
+  const original = ['第一段', '第二段'].join(CHUNK_SEPARATOR);
+  fs.writeFileSync(digestPath, original, 'utf8');
+
+  const args = [
+    '--state-dir', tmpDir,
+    '--to-user-id', 'melody@im.wechat',
+    '--text-file', digestPath,
+    '--idempotency-key', 'linear-digest-2026-10-12',
+  ];
+  const clientIdSeeds: Array<string | undefined> = [];
+  // The very first segment fails, so nothing is confirmed, yet Weixin may
+  // already have shown it.
+  const dependencies = {
+    createPlatformPlugin: weixinSendTestPlugin({ delivered, failOnDeliveryIndex: 0, clientIdSeeds }),
+  };
+
+  await assert.rejects(() => runWeixinSend(args, dependencies), /transport unavailable/);
+  const partial = weixinSendReceipts(tmpDir)['melody@im.wechat:linear-digest-2026-10-12'];
+  assert.equal(partial.status, 'partial');
+  assert.equal(partial.deliveredDeliveryCount, 0);
+
+  // A regenerated file would go out under fresh client ids next to the old
+  // first segment.
+  fs.writeFileSync(digestPath, ['新第一段', '新第二段'].join(CHUNK_SEPARATOR), 'utf8');
+  await assert.rejects(() => runWeixinSend(args, dependencies), /idempotency key|幂等键/);
+  assert.deepEqual(delivered, []);
+
+  // The original text resumes under the client ids of the first run.
+  fs.writeFileSync(digestPath, original, 'utf8');
+  await runWeixinSend(args, dependencies);
+  assert.deepEqual(delivered, ['第一段', '第二段']);
+  assert.equal(clientIdSeeds.length, 2);
+  assert.equal(clientIdSeeds[1], clientIdSeeds[0]);
+});
+
+test('weixin send leaves the key free when the send is refused before any segment goes out', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-send-refused-'));
+  const digestPath = path.join(tmpDir, 'digest.md');
+  const delivered: string[] = [];
+  fs.writeFileSync(digestPath, '早报正文', 'utf8');
+
+  const args = [
+    '--state-dir', tmpDir,
+    '--to-user-id', 'melody@im.wechat',
+    '--text-file', digestPath,
+    '--idempotency-key', 'linear-digest-2026-10-13',
+  ];
+  const dependencies = {
+    createPlatformPlugin: weixinSendTestPlugin({ delivered, refuseOnce: true }),
+  };
+
+  await assert.rejects(() => runWeixinSend(args, dependencies), /session paused/);
+  assert.equal(fs.existsSync(path.join(tmpDir, 'runtime', 'weixin-outbound-receipts.json')), false);
+
+  // Nothing reached Weixin, so a regenerated file may still use the key.
+  fs.writeFileSync(digestPath, '更新后的早报正文', 'utf8');
+  await runWeixinSend(args, dependencies);
+  assert.deepEqual(delivered, ['更新后的早报正文']);
 });
 
 test('weixin send refuses a text file that formats down to nothing', async () => {

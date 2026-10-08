@@ -57,6 +57,7 @@ interface WeixinSendPlatformPlugin {
     success: boolean;
     error?: string | null;
     deliveredCount?: number;
+    /** Set once sending reached the segments; absent on an earlier refusal. */
     totalDeliveryCount?: number;
   } | null | undefined>;
 }
@@ -367,7 +368,13 @@ async function runWeixinSend(
       });
 
       if (!result?.success) {
-        if (deliveredTotal > 0) {
+        // A segment Weixin accepted but never confirmed is not counted, so a run
+        // can fail with nothing confirmed yet a segment already on the
+        // recipient's phone. Keep the receipt as soon as sending reached the
+        // segments, so a retry under this key stays tied to this text and this
+        // split. A refusal before that (not started, session paused) put
+        // nothing on the wire and leaves the key free.
+        if (deliveredTotal > 0 || typeof result?.totalDeliveryCount === 'number') {
           await saveReceipt('partial');
         }
         throw new Error(i18n.t('cli.send.failed', {

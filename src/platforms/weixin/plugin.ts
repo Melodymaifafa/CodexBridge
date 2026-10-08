@@ -444,6 +444,8 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
         errorCode: SESSION_EXPIRED_ERRCODE,
       };
     }
+    // The refusals above leave totalDeliveryCount out: nothing went on the wire,
+    // and the send CLI relies on that to leave the idempotency key unclaimed.
     const deliveries = this.buildTextDeliveries({
       externalScopeId,
       content,
