@@ -403,6 +403,31 @@ test('weixin send refuses a text file that formats down to nothing', async () =>
   assert.equal(fs.existsSync(path.join(tmpDir, 'runtime', 'weixin-outbound-receipts.json')), false);
 });
 
+test('weixin send refuses to send when the receipts file is damaged', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-send-corrupt-'));
+  const digestPath = path.join(tmpDir, 'digest.md');
+  const receiptsFile = path.join(tmpDir, 'runtime', 'weixin-outbound-receipts.json');
+  const delivered: string[] = [];
+  fs.writeFileSync(digestPath, '早报正文', 'utf8');
+  fs.mkdirSync(path.dirname(receiptsFile), { recursive: true });
+  // Cut off part way through a write: the keys it held can no longer be read.
+  const damaged = '{"melody@im.wechat:linear-digest-2026-08-01": {"sentAt": "2026-08-01T00:00:00.000Z"';
+  fs.writeFileSync(receiptsFile, damaged, 'utf8');
+
+  await assert.rejects(() => runWeixinSend([
+    '--state-dir', tmpDir,
+    '--to-user-id', 'melody@im.wechat',
+    '--text-file', digestPath,
+    '--idempotency-key', 'linear-digest-2026-08-01',
+  ], {
+    createPlatformPlugin: weixinSendTestPlugin({ delivered }),
+  }), /weixin-outbound-receipts\.json/);
+
+  assert.deepEqual(delivered, []);
+  // Left as found, so whoever repairs it still has the original contents.
+  assert.equal(fs.readFileSync(receiptsFile, 'utf8'), damaged);
+});
+
 test('weixin send treats a receipt written before chunk tracking as fully sent', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-send-legacy-'));
   const digestPath = path.join(tmpDir, 'digest.md');

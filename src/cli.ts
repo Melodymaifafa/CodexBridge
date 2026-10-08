@@ -1285,15 +1285,38 @@ function printUsage() {
 }
 
 function readWeixinOutboundReceipts(filePath: string): Record<string, WeixinOutboundReceipt> {
-  if (!fs.existsSync(filePath)) {
-    return {};
-  }
+  // The receipts are the only record of which keys already went out. Reading a
+  // damaged or unreadable file as empty would let this run send again and then
+  // overwrite the file, dropping every other key with it, so only a missing
+  // file counts as empty.
+  let raw: string;
   try {
-    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
+    raw = fs.readFileSync(filePath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      return {};
+    }
+    throw new Error(createI18n().t('cli.send.receiptsUnreadable', {
+      receiptsFile: filePath,
+      error: error instanceof Error ? error.message : String(error),
+    }));
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(createI18n().t('cli.send.receiptsUnreadable', {
+      receiptsFile: filePath,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(createI18n().t('cli.send.receiptsUnreadable', {
+      receiptsFile: filePath,
+      error: 'not a JSON object',
+    }));
+  }
+  return parsed as Record<string, WeixinOutboundReceipt>;
 }
 
 async function writeWeixinOutboundReceipts(
