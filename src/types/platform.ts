@@ -26,12 +26,15 @@ export interface PlatformDeliveryRequest {
 
 export interface PlatformTextDeliveryResult {
   success: boolean;
+  /** Deliveries sent by this call, not counting any skipped prefix. */
   deliveredCount: number;
   deliveredText: string;
   failedIndex: number | null;
   failedText: string;
   error: string;
   errorCode?: number | null;
+  /** Deliveries the content splits into, including a skipped prefix. */
+  totalDeliveryCount?: number;
 }
 
 export interface PlatformMediaDeliveryResult {
@@ -65,6 +68,13 @@ export interface PlatformPluginContract {
   sendText?(params: {
     externalScopeId: string;
     content: string;
+    /**
+     * Leading deliveries to skip because a previous attempt already delivered
+     * them. Chunk boundaries stay stable only when every attempt splits the
+     * same full content, so a resume passes the whole text plus this offset
+     * rather than the leftover text.
+     */
+    skipDeliveryCount?: number;
   }): Promise<PlatformTextDeliveryResult | null | undefined>;
   sendTyping?(params: {
     externalScopeId: string;

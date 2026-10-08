@@ -48,10 +48,23 @@ interface WeixinSendPlatformPlugin {
   sendText(params: {
     externalScopeId: string;
     content: string;
+    skipDeliveryCount?: number;
   }): Promise<{
     success: boolean;
     error?: string | null;
+    deliveredCount?: number;
+    totalDeliveryCount?: number;
   } | null | undefined>;
+}
+
+interface WeixinOutboundReceipt {
+  sentAt: string;
+  textFile: string;
+  toUserId: string;
+  /** Absent on receipts written before partial progress was tracked. */
+  status?: 'sent' | 'partial';
+  deliveredDeliveryCount?: number;
+  totalDeliveryCount?: number;
 }
 
 interface WeixinSendDependencies {
@@ -106,6 +119,8 @@ interface PendingRestartNotification {
   queuedAt: string;
 }
 
+const WEIXIN_SEND_LOCK_WAIT_MS = 120_000;
+const WEIXIN_SEND_LOCK_RETRY_INTERVAL_MS = 200;
 const DEFAULT_CODEX_NATIVE_API_HOST = '127.0.0.1';
 const DEFAULT_CODEX_NATIVE_API_PORT = 43182;
 
@@ -232,6 +247,8 @@ async function runWeixinSend(
     throw new Error(i18n.t('cli.send.requiredArgs'));
   }
 
+  const toUserId = options.toUserId;
+  const idempotencyKey = options.idempotencyKey;
   const stateDir = path.resolve(options.stateDir ?? defaultCodexBridgeStateDir());
   const textFile = path.resolve(options.textFile);
   const content = await fsp.readFile(textFile, 'utf8');
@@ -240,41 +257,78 @@ async function runWeixinSend(
   }
 
   const receiptsFile = path.join(stateDir, 'runtime', 'weixin-outbound-receipts.json');
-  const receiptKey = `${options.toUserId}:${options.idempotencyKey}`;
-  const receipts = readWeixinOutboundReceipts(receiptsFile);
-  if (receipts[receiptKey]) {
-    process.stdout.write(`${i18n.t('cli.send.skipped', { idempotencyKey: options.idempotencyKey })}\n`);
-    return;
-  }
-
-  const platformPlugin = dependencies.createPlatformPlugin?.(stateDir) ?? new WeixinPlatformPlugin({
-    accountStore: new WeixinAccountStore({
-      rootDir: path.join(stateDir, 'weixin', 'accounts'),
-    }),
+  const receiptKey = `${toUserId}:${idempotencyKey}`;
+  // The claim-then-send sequence below must not interleave with another process
+  // holding the same idempotency key, or both would read "not sent yet" and
+  // deliver their own copy. The lock makes the whole sequence serial and the
+  // receipt file is re-read inside it.
+  const sendLock = await acquireServeLock(path.join(stateDir, 'runtime', 'weixin-send.lock'), {
+    waitMs: WEIXIN_SEND_LOCK_WAIT_MS,
+    retryIntervalMs: WEIXIN_SEND_LOCK_RETRY_INTERVAL_MS,
+    busyMessageKey: 'cli.send.lockBusy',
   });
-  await platformPlugin.start();
   try {
-    const result = await platformPlugin.sendText({
-      externalScopeId: options.toUserId,
-      content,
+    const receipts = readWeixinOutboundReceipts(receiptsFile);
+    const receipt = receipts[receiptKey];
+    if (receipt && receipt.status !== 'partial') {
+      process.stdout.write(`${i18n.t('cli.send.skipped', { idempotencyKey })}\n`);
+      return;
+    }
+
+    // A long message goes out in several segments. When an earlier run got part
+    // way through, skip exactly that many segments so the delivered ones are
+    // never sent twice. The offset travels with the FULL text: segment
+    // boundaries only line up with the earlier run when both runs split the
+    // same content, and re-splitting a single segment can reformat it (a
+    // segment that starts inside a code fence loses the fence).
+    const alreadyDelivered = Math.max(0, Math.trunc(Number(receipt?.deliveredDeliveryCount ?? 0)));
+    if (alreadyDelivered > 0) {
+      process.stdout.write(`${i18n.t('cli.send.resumed', {
+        deliveredDeliveryCount: alreadyDelivered,
+      })}\n`);
+    }
+
+    const platformPlugin = dependencies.createPlatformPlugin?.(stateDir) ?? new WeixinPlatformPlugin({
+      accountStore: new WeixinAccountStore({
+        rootDir: path.join(stateDir, 'weixin', 'accounts'),
+      }),
     });
-    if (!result?.success) {
-      throw new Error(i18n.t('cli.send.failed', {
-        error: result?.error || 'unknown error',
-      }));
+    await platformPlugin.start();
+    try {
+      const result = await platformPlugin.sendText({
+        externalScopeId: toUserId,
+        content,
+        skipDeliveryCount: alreadyDelivered,
+      });
+      const deliveredTotal = alreadyDelivered
+        + Math.max(0, Math.trunc(Number(result?.deliveredCount ?? 0)));
+      const saveReceipt = (status: 'sent' | 'partial') => writeWeixinOutboundReceipts(receiptsFile, {
+        ...receipts,
+        [receiptKey]: {
+          sentAt: new Date().toISOString(),
+          textFile,
+          toUserId,
+          status,
+          deliveredDeliveryCount: deliveredTotal,
+          totalDeliveryCount: result?.totalDeliveryCount,
+        },
+      });
+
+      if (!result?.success) {
+        if (deliveredTotal > 0) {
+          await saveReceipt('partial');
+        }
+        throw new Error(i18n.t('cli.send.failed', {
+          error: result?.error || 'unknown error',
+        }));
+      }
+      await saveReceipt('sent');
+    } finally {
+      await platformPlugin.stop();
     }
   } finally {
-    await platformPlugin.stop();
+    await sendLock.release();
   }
-
-  await writeWeixinOutboundReceipts(receiptsFile, {
-    ...receipts,
-    [receiptKey]: {
-      sentAt: new Date().toISOString(),
-      textFile,
-      toUserId: options.toUserId,
-    },
-  });
   process.stdout.write(`${i18n.t('cli.send.success')}\n`);
 }
 
@@ -831,36 +885,69 @@ function truncate(value: string, maxLength: number) {
   return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
-async function acquireServeLock(lockPath: string): Promise<ServeLock> {
+async function acquireServeLock(lockPath: string, {
+  waitMs = 0,
+  retryIntervalMs = 100,
+  busyMessageKey = 'cli.lock.alreadyRunning',
+}: {
+  waitMs?: number;
+  retryIntervalMs?: number;
+  busyMessageKey?: string;
+} = {}): Promise<ServeLock> {
   await fsp.mkdir(path.dirname(lockPath), { recursive: true });
-  try {
-    return await createServeLock(lockPath);
-  } catch (error) {
-    if (!(error && typeof error === 'object' && 'code' in error) || error.code !== 'EEXIST') {
-      throw error;
+  const deadline = Date.now() + Math.max(0, waitMs);
+  for (;;) {
+    try {
+      return await createServeLock(lockPath);
+    } catch (error) {
+      if (!(error && typeof error === 'object' && 'code' in error) || error.code !== 'EEXIST') {
+        throw error;
+      }
     }
-  }
 
-  const existing = readServeLock(lockPath);
-  if (existing?.pid && isProcessAlive(existing.pid)) {
-    throw new Error(createI18n().t('cli.lock.alreadyRunning', {
-      lockPath,
-      pid: existing.pid,
-    }));
-  }
+    const existing = readServeLock(lockPath);
+    if (existing?.pid && isProcessAlive(existing.pid)) {
+      if (Date.now() >= deadline) {
+        throw new Error(createI18n().t(busyMessageKey, {
+          lockPath,
+          pid: existing.pid,
+        }));
+      }
+      await sleep(Math.max(1, retryIntervalMs));
+      continue;
+    }
 
-  await fsp.rm(lockPath, { force: true });
-  return createServeLock(lockPath);
+    // Stale lock from a dead process: drop it and retry the exclusive create so
+    // two reclaiming processes cannot both believe they won.
+    await fsp.rm(lockPath, { force: true });
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function createServeLock(lockPath: string): Promise<ServeLock> {
-  const handle = await fsp.open(lockPath, 'wx');
   const payload: ServeLockPayload = {
     pid: process.pid,
     startedAt: new Date().toISOString(),
     cwd: process.cwd(),
   };
-  await handle.writeFile(`${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  // Stage the payload first, then publish it with link(), which fails with
+  // EEXIST when the lock is already held. Creating the lock file empty and
+  // filling it afterwards would let a competitor read an owner-less file and
+  // reclaim it as stale while the first holder is still starting up.
+  const stagingPath = `${lockPath}.${process.pid}.${randomFileSuffix()}.staging`;
+  await fsp.writeFile(stagingPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  try {
+    await fsp.link(stagingPath, lockPath);
+  } finally {
+    try {
+      await fsp.rm(stagingPath, { force: true });
+    } catch {}
+  }
   let released = false;
 
   return {
@@ -870,9 +957,6 @@ async function createServeLock(lockPath: string): Promise<ServeLock> {
         return;
       }
       released = true;
-      try {
-        await handle.close();
-      } catch {}
       await fsp.rm(lockPath, { force: true });
     },
     releaseSync() {
@@ -881,13 +965,14 @@ async function createServeLock(lockPath: string): Promise<ServeLock> {
       }
       released = true;
       try {
-        handle.close().catch(() => {});
-      } catch {}
-      try {
         fs.rmSync(lockPath, { force: true });
       } catch {}
     },
   };
+}
+
+function randomFileSuffix() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function readServeLock(lockPath: string): ServeLockPayload | null {
@@ -1070,11 +1155,7 @@ function printUsage() {
   ].join('\n'));
 }
 
-function readWeixinOutboundReceipts(filePath: string): Record<string, {
-  sentAt: string;
-  textFile: string;
-  toUserId: string;
-}> {
+function readWeixinOutboundReceipts(filePath: string): Record<string, WeixinOutboundReceipt> {
   if (!fs.existsSync(filePath)) {
     return {};
   }
@@ -1088,14 +1169,10 @@ function readWeixinOutboundReceipts(filePath: string): Record<string, {
 
 async function writeWeixinOutboundReceipts(
   filePath: string,
-  receipts: Record<string, {
-    sentAt: string;
-    textFile: string;
-    toUserId: string;
-  }>,
+  receipts: Record<string, WeixinOutboundReceipt>,
 ) {
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  const temporaryPath = `${filePath}.${process.pid}.${randomFileSuffix()}.tmp`;
   await fsp.writeFile(temporaryPath, `${JSON.stringify(receipts, null, 2)}\n`, 'utf8');
   await fsp.rename(temporaryPath, filePath);
 }

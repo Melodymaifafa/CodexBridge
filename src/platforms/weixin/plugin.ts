@@ -404,7 +404,11 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
     return { path: filePath };
   }
 
-  async sendText({ externalScopeId, content }: { externalScopeId: string; content: string }) {
+  async sendText({ externalScopeId, content, skipDeliveryCount = 0 }: {
+    externalScopeId: string;
+    content: string;
+    skipDeliveryCount?: number;
+  }) {
     if (!this.client) {
       return {
         success: false,
@@ -432,8 +436,15 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
       externalScopeId,
       content,
     });
+    // Resume from the caller's offset. The split always runs over the full
+    // content, so the boundaries match the earlier attempt and the skipped
+    // deliveries are exactly the ones already received.
+    const firstIndex = Math.min(
+      Math.max(0, Math.trunc(Number(skipDeliveryCount) || 0)),
+      deliveries.length,
+    );
     const deliveredTexts = [];
-    for (let index = 0; index < deliveries.length; index += 1) {
+    for (let index = firstIndex; index < deliveries.length; index += 1) {
       const delivery = deliveries[index];
       const chunkText = delivery.payload.msg.item_list[0].text_item.text;
       const outcome = await this.sendDeliveryWithRetry({
@@ -449,6 +460,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
           failedText: chunkText,
           error: outcome.error,
           errorCode: outcome.errorCode ?? null,
+          totalDeliveryCount: deliveries.length,
         };
       }
       deliveredTexts.push(chunkText);
@@ -461,6 +473,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
       failedText: '',
       error: '',
       errorCode: null,
+      totalDeliveryCount: deliveries.length,
     };
   }
 
