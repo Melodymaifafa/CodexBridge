@@ -1134,3 +1134,86 @@ test('WeixinPlatformPlugin keeps fenced code blocks intact when splitting long t
   assert.match(codeBlockChunk, /--project agent-social-publisher/);
   assert.match(codeBlockChunk, /```/);
 });
+
+test('WeixinPlatformPlugin sendText skips the deliveries a previous attempt already delivered', async () => {
+  const rootDir = makeTempAccountsDir();
+  const plugin = makePlugin({
+    accountStore: new WeixinAccountStore({ rootDir }),
+    config: {
+      enabled: true,
+      accountId: 'bot-account',
+      token: 'token',
+      baseUrl: 'https://ilinkai.weixin.qq.com',
+      cdnBaseUrl: 'https://novac2c.cdn.weixin.qq.com/c2c',
+      dmPolicy: 'open',
+      groupPolicy: 'disabled',
+      allowFrom: [],
+      groupAllowFrom: [],
+      stateDir: path.dirname(path.dirname(rootDir)),
+      accountsDir: rootDir,
+      maxMessageLength: 20,
+    },
+  });
+  const content = '12345678901234567890\n\nabcdefghijabcdefghij\n\nTail';
+  const expected = plugin
+    .buildTextDeliveries({ externalScopeId: 'wxid_sender', content })
+    .map((delivery) => delivery.payload.msg.item_list[0].text_item.text);
+  assert.equal(expected.length, 3);
+
+  const sent: string[] = [];
+  (plugin as any).client = {
+    async sendMessage({ text }: { text: string }) {
+      sent.push(text);
+      return { ret: 0 };
+    },
+  };
+
+  const result = await plugin.sendText({
+    externalScopeId: 'wxid_sender',
+    content,
+    skipDeliveryCount: 2,
+  });
+
+  assert.equal(result.success, true, result.error);
+  assert.equal(result.deliveredCount, 1);
+  assert.equal(result.totalDeliveryCount, 3);
+  // Only the trailing delivery goes out; the first two are treated as received.
+  assert.deepEqual(sent, [expected[2]]);
+});
+
+test('WeixinPlatformPlugin derives stable per-delivery client ids from a seed', () => {
+  const rootDir = makeTempAccountsDir();
+  const plugin = makePlugin({
+    accountStore: new WeixinAccountStore({ rootDir }),
+    config: {
+      enabled: true,
+      accountId: 'bot-account',
+      token: 'token',
+      baseUrl: 'https://ilinkai.weixin.qq.com',
+      cdnBaseUrl: 'https://novac2c.cdn.weixin.qq.com/c2c',
+      dmPolicy: 'open',
+      groupPolicy: 'disabled',
+      allowFrom: [],
+      groupAllowFrom: [],
+      stateDir: path.dirname(path.dirname(rootDir)),
+      accountsDir: rootDir,
+      maxMessageLength: 20,
+    },
+  });
+  const content = '12345678901234567890\n\nabcdefghijabcdefghij\n\nTail';
+  const clientIds = (clientIdSeed?: string) => plugin
+    .buildTextDeliveries({ externalScopeId: 'wxid_sender', content, clientIdSeed })
+    .map((delivery) => delivery.payload.msg.client_id);
+
+  const first = clientIds('melody@im.wechat:digest\nabc');
+  assert.equal(first.length, 3);
+  // A later run with the same seed repeats each delivery under its earlier id.
+  assert.deepEqual(clientIds('melody@im.wechat:digest\nabc'), first);
+  assert.equal(new Set(first).size, 3);
+  assert.notDeepEqual(clientIds('melody@im.wechat:digest\nother'), first);
+  for (const clientId of first) {
+    assert.match(clientId, /^codexbridge-weixin-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  }
+  // Without a seed every build still gets fresh ids.
+  assert.notDeepEqual(clientIds(), clientIds());
+});

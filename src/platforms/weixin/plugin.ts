@@ -239,15 +239,26 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
     };
   }
 
-  buildTextDeliveries({ externalScopeId, content }: { externalScopeId: string; content: string }): WeixinTextDelivery[] {
+  /** The segment texts sendText sends for this content, in order. */
+  planTextDeliveries(content: string): string[] {
+    return splitWeixinText(formatWeixinText(content), this.config.maxMessageLength);
+  }
+
+  buildTextDeliveries({ externalScopeId, content, clientIdSeed = null }: {
+    externalScopeId: string;
+    content: string;
+    clientIdSeed?: string | null;
+  }): WeixinTextDelivery[] {
     const contextToken = getStoredContextToken(this.config.accountsDir, this.config.accountId, externalScopeId);
-    return splitWeixinText(formatWeixinText(content), this.config.maxMessageLength).map((text) => ({
+    return this.planTextDeliveries(content).map((text, index) => ({
       kind: 'weixin.sendmessage',
       payload: buildTextMessageReq({
         to: externalScopeId,
         text,
         contextToken,
-        clientId: `codexbridge-weixin-${crypto.randomUUID()}`,
+        clientId: clientIdSeed
+          ? deriveWeixinClientId(clientIdSeed, index)
+          : `codexbridge-weixin-${crypto.randomUUID()}`,
       }) as WeixinTextDelivery['payload'],
     }));
   }
@@ -404,7 +415,12 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
     return { path: filePath };
   }
 
-  async sendText({ externalScopeId, content }: { externalScopeId: string; content: string }) {
+  async sendText({ externalScopeId, content, skipDeliveryCount = 0, clientIdSeed = null }: {
+    externalScopeId: string;
+    content: string;
+    skipDeliveryCount?: number;
+    clientIdSeed?: string | null;
+  }) {
     if (!this.client) {
       return {
         success: false,
@@ -428,12 +444,22 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
         errorCode: SESSION_EXPIRED_ERRCODE,
       };
     }
+    // The refusals above leave totalDeliveryCount out: nothing went on the wire,
+    // and the send CLI relies on that to hand the idempotency key back.
     const deliveries = this.buildTextDeliveries({
       externalScopeId,
       content,
+      clientIdSeed,
     });
+    // Resume from the caller's offset. The split always runs over the full
+    // content, so the boundaries match the earlier attempt and the skipped
+    // deliveries are exactly the ones already received.
+    const firstIndex = Math.min(
+      Math.max(0, Math.trunc(Number(skipDeliveryCount) || 0)),
+      deliveries.length,
+    );
     const deliveredTexts = [];
-    for (let index = 0; index < deliveries.length; index += 1) {
+    for (let index = firstIndex; index < deliveries.length; index += 1) {
       const delivery = deliveries[index];
       const chunkText = delivery.payload.msg.item_list[0].text_item.text;
       const outcome = await this.sendDeliveryWithRetry({
@@ -449,6 +475,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
           failedText: chunkText,
           error: outcome.error,
           errorCode: outcome.errorCode ?? null,
+          totalDeliveryCount: deliveries.length,
         };
       }
       deliveredTexts.push(chunkText);
@@ -461,6 +488,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
       failedText: '',
       error: '',
       errorCode: null,
+      totalDeliveryCount: deliveries.length,
     };
   }
 
@@ -961,6 +989,13 @@ function extractWeixinErrorCode(error: unknown): number | null {
 
 function joinDeliveredTexts(chunks: string[]) {
   return Array.isArray(chunks) ? chunks.filter(Boolean).join('\n\n').trim() : '';
+}
+
+// The same seed and index always give the same client id, shaped like the
+// random ones, so a later run repeating a segment reuses its earlier id.
+function deriveWeixinClientId(seed: string, index: number) {
+  const hex = crypto.createHash('sha256').update(`${seed}\n${index}`).digest('hex');
+  return `codexbridge-weixin-${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
 function stringValue(value: unknown) {

@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -35,6 +36,50 @@ interface WeixinServeArgs {
   cwd: string | null;
 }
 
+interface WeixinSendArgs {
+  stateDir: string | null;
+  toUserId: string | null;
+  textFile: string | null;
+  idempotencyKey: string | null;
+}
+
+interface WeixinSendPlatformPlugin {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  /** The segment texts sendText sends for this content, in order. */
+  planTextDeliveries(content: string): string[];
+  sendText(params: {
+    externalScopeId: string;
+    content: string;
+    skipDeliveryCount?: number;
+    clientIdSeed?: string;
+  }): Promise<{
+    success: boolean;
+    error?: string | null;
+    deliveredCount?: number;
+    /** Set once sending reached the segments; absent on an earlier refusal. */
+    totalDeliveryCount?: number;
+  } | null | undefined>;
+}
+
+interface WeixinOutboundReceipt {
+  sentAt: string;
+  textFile: string;
+  toUserId: string;
+  /** Absent on receipts written before partial progress was tracked. */
+  status?: 'sent' | 'partial';
+  deliveredDeliveryCount?: number;
+  totalDeliveryCount?: number;
+  /** SHA-256 of the text the delivery counts refer to. */
+  contentSha256?: string;
+  /** SHA-256 of the segment texts that text was split into. */
+  deliveryPlanSha256?: string;
+}
+
+interface WeixinSendDependencies {
+  createPlatformPlugin?: (stateDir: string) => WeixinSendPlatformPlugin;
+}
+
 interface WeixinClearContextArgs {
   stateDir: string | null;
   accountId: string | null;
@@ -69,6 +114,13 @@ interface ServeLockPayload {
   pid: number;
   startedAt: string;
   cwd: string;
+  /** Random per acquisition, so no two lock files ever have the same content. */
+  token?: string;
+}
+
+interface ServeLockFile {
+  content: string;
+  payload: ServeLockPayload | null;
 }
 
 interface ServeLock {
@@ -83,6 +135,8 @@ interface PendingRestartNotification {
   queuedAt: string;
 }
 
+const WEIXIN_SEND_LOCK_WAIT_MS = 120_000;
+const WEIXIN_SEND_LOCK_RETRY_INTERVAL_MS = 200;
 const DEFAULT_CODEX_NATIVE_API_HOST = '127.0.0.1';
 const DEFAULT_CODEX_NATIVE_API_PORT = 43182;
 
@@ -94,6 +148,9 @@ async function main(argv: string[] = process.argv.slice(2)) {
   }
   if (group === 'weixin' && command === 'serve') {
     return runWeixinServe(args);
+  }
+  if (group === 'weixin' && command === 'send') {
+    return runWeixinSend(args);
   }
   if (group === 'weixin' && command === 'clear-context') {
     return runWeixinClearContext(args);
@@ -194,6 +251,165 @@ async function runWeixinClearContext(args: string[]) {
   clearContextTokensForAccount(accountsDir, accountId);
   process.stdout.write(`${i18n.t('cli.clearContext.success')}\n`);
   process.stdout.write(`${i18n.t('cli.clearContext.account', { value: accountId })}\n`);
+}
+
+async function runWeixinSend(
+  args: string[],
+  dependencies: WeixinSendDependencies = {},
+) {
+  const i18n = createI18n();
+  const options = parseWeixinSendArgs(args);
+  if (!options.toUserId || !options.textFile || !options.idempotencyKey) {
+    throw new Error(i18n.t('cli.send.requiredArgs'));
+  }
+
+  const toUserId = options.toUserId;
+  const idempotencyKey = options.idempotencyKey;
+  const stateDir = path.resolve(options.stateDir ?? defaultCodexBridgeStateDir());
+  const textFile = path.resolve(options.textFile);
+  const content = await fsp.readFile(textFile, 'utf8');
+  if (!content.trim()) {
+    throw new Error(i18n.t('cli.send.emptyTextFile', { textFile }));
+  }
+  const contentSha256 = crypto.createHash('sha256').update(content).digest('hex');
+
+  const receiptsFile = path.join(stateDir, 'runtime', 'weixin-outbound-receipts.json');
+  const receiptKey = `${toUserId}:${idempotencyKey}`;
+  // The claim-then-send sequence below must not interleave with another process
+  // holding the same idempotency key, or both would read "not sent yet" and
+  // deliver their own copy. The lock makes the whole sequence serial and the
+  // receipt file is re-read inside it.
+  const sendLock = await acquireServeLock(path.join(stateDir, 'runtime', 'weixin-send.lock'), {
+    waitMs: WEIXIN_SEND_LOCK_WAIT_MS,
+    retryIntervalMs: WEIXIN_SEND_LOCK_RETRY_INTERVAL_MS,
+    busyMessageKey: 'cli.send.lockBusy',
+  });
+  try {
+    const receipts = readWeixinOutboundReceipts(receiptsFile);
+    const receipt = receipts[receiptKey];
+    if (receipt && receipt.status !== 'partial') {
+      process.stdout.write(`${i18n.t('cli.send.skipped', { idempotencyKey })}\n`);
+      return;
+    }
+    // A long message goes out in several segments. When an earlier run got part
+    // way through, skip exactly that many segments so the delivered ones are
+    // never sent twice. The offset travels with the FULL text: segment
+    // boundaries only line up with the earlier run when both runs split the
+    // same content, and re-splitting a single segment can reformat it (a
+    // segment that starts inside a code fence loses the fence).
+    const alreadyDelivered = Math.max(0, Math.trunc(Number(receipt?.deliveredDeliveryCount ?? 0)));
+    // A partial receipt counts segments of the text it was written for. Applied
+    // to an edited or regenerated file it would skip the wrong segments and
+    // splice the old beginning onto the new ending, so only the same text may
+    // resume it.
+    if (receipt && receipt.contentSha256 !== contentSha256) {
+      throw new Error(i18n.t('cli.send.partialContentChanged', {
+        idempotencyKey,
+        deliveredDeliveryCount: alreadyDelivered,
+      }));
+    }
+
+    const platformPlugin = dependencies.createPlatformPlugin?.(stateDir) ?? new WeixinPlatformPlugin({
+      accountStore: new WeixinAccountStore({
+        rootDir: path.join(stateDir, 'weixin', 'accounts'),
+      }),
+    });
+    await platformPlugin.start();
+    try {
+      // Formatting drops what Weixin cannot carry, so a file holding nothing
+      // else (only an image, say) splits into no segments at all. Sending it
+      // would report success and use up the key with nothing delivered.
+      const plannedTexts = platformPlugin.planTextDeliveries(content);
+      if (plannedTexts.length === 0) {
+        throw new Error(i18n.t('cli.send.nothingToSend', { textFile }));
+      }
+      // The split also depends on settings such as the message length limit,
+      // so the same text can come out in different segments after a change.
+      // The skipped count only means anything against the split it counted.
+      const deliveryPlanSha256 = crypto.createHash('sha256')
+        .update(JSON.stringify(plannedTexts))
+        .digest('hex');
+      if (receipt && receipt.deliveryPlanSha256 !== deliveryPlanSha256) {
+        throw new Error(i18n.t('cli.send.partialPlanChanged', {
+          idempotencyKey,
+          deliveredDeliveryCount: alreadyDelivered,
+        }));
+      }
+      if (alreadyDelivered > 0) {
+        process.stdout.write(`${i18n.t('cli.send.resumed', {
+          deliveredDeliveryCount: alreadyDelivered,
+        })}\n`);
+      }
+
+      const saveReceipt = (progress: Pick<WeixinOutboundReceipt, 'status' | 'deliveredDeliveryCount' | 'totalDeliveryCount'>) => (
+        writeWeixinOutboundReceipts(receiptsFile, {
+          ...receipts,
+          [receiptKey]: {
+            sentAt: new Date().toISOString(),
+            textFile,
+            toUserId,
+            ...progress,
+            contentSha256,
+            deliveryPlanSha256,
+          },
+        })
+      );
+      // Tie the key to this text and this split before any segment goes out.
+      // Written only once the send returned, a run killed (or unable to write)
+      // after Weixin accepted a segment would leave no receipt, and a
+      // regenerated file under the same key would then go out under fresh
+      // client ids next to what already arrived.
+      await saveReceipt({
+        status: 'partial',
+        deliveredDeliveryCount: alreadyDelivered,
+        totalDeliveryCount: plannedTexts.length,
+      });
+
+      // Segment client ids come from the key and the text rather than at random.
+      // A segment Weixin accepted but whose reply timed out is not counted as
+      // delivered, so the next run sends it again; with the same id as before
+      // it reads as a repeat of that request, not as a second message.
+      const result = await platformPlugin.sendText({
+        externalScopeId: toUserId,
+        content,
+        skipDeliveryCount: alreadyDelivered,
+        clientIdSeed: `${receiptKey}\n${contentSha256}`,
+      });
+      const deliveredNow = Math.max(0, Math.trunc(Number(result?.deliveredCount ?? 0)));
+      const deliveredTotal = alreadyDelivered + deliveredNow;
+
+      if (!result?.success) {
+        // A segment Weixin accepted but never confirmed is not counted, so a run
+        // can fail with nothing confirmed yet a segment already on the
+        // recipient's phone. Once sending reached the segments the receipt
+        // stays, so a retry under this key stays tied to this text and this
+        // split. A refusal before that (not started, session paused) put
+        // nothing on the wire, so the key goes back to how this run found it.
+        if (deliveredNow > 0 || typeof result?.totalDeliveryCount === 'number') {
+          await saveReceipt({
+            status: 'partial',
+            deliveredDeliveryCount: deliveredTotal,
+            totalDeliveryCount: result?.totalDeliveryCount,
+          });
+        } else {
+          await writeWeixinOutboundReceipts(receiptsFile, receipts);
+        }
+        throw new Error(i18n.t('cli.send.failed', {
+          error: result?.error || 'unknown error',
+        }));
+      }
+      await saveReceipt({
+        status: 'sent',
+        deliveredDeliveryCount: deliveredTotal,
+        totalDeliveryCount: result.totalDeliveryCount,
+      });
+    } finally {
+      await platformPlugin.stop();
+    }
+  } finally {
+    await sendLock.release();
+  }
+  process.stdout.write(`${i18n.t('cli.send.success')}\n`);
 }
 
 async function runWeixinServe(args: string[]) {
@@ -554,6 +770,39 @@ function parseWeixinServeArgs(args: string[]): WeixinServeArgs {
   return options;
 }
 
+function parseWeixinSendArgs(args: string[]): WeixinSendArgs {
+  const options: WeixinSendArgs = {
+    stateDir: null,
+    toUserId: null,
+    textFile: null,
+    idempotencyKey: null,
+  };
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    const next = args[index + 1];
+    if (arg === '--state-dir' && next) {
+      options.stateDir = next;
+      index += 1;
+      continue;
+    }
+    if (arg === '--to-user-id' && next) {
+      options.toUserId = next;
+      index += 1;
+      continue;
+    }
+    if (arg === '--text-file' && next) {
+      options.textFile = next;
+      index += 1;
+      continue;
+    }
+    if (arg === '--idempotency-key' && next) {
+      options.idempotencyKey = next;
+      index += 1;
+    }
+  }
+  return options;
+}
+
 function parseWeixinClearContextArgs(args: string[]): WeixinClearContextArgs {
   const options: WeixinClearContextArgs = {
     stateDir: null,
@@ -716,36 +965,110 @@ function truncate(value: string, maxLength: number) {
   return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
-async function acquireServeLock(lockPath: string): Promise<ServeLock> {
+async function acquireServeLock(lockPath: string, {
+  waitMs = 0,
+  retryIntervalMs = 100,
+  busyMessageKey = 'cli.lock.alreadyRunning',
+}: {
+  waitMs?: number;
+  retryIntervalMs?: number;
+  busyMessageKey?: string;
+} = {}): Promise<ServeLock> {
   await fsp.mkdir(path.dirname(lockPath), { recursive: true });
+  const deadline = Date.now() + Math.max(0, waitMs);
+  for (;;) {
+    try {
+      return await createServeLock(lockPath);
+    } catch (error) {
+      if (!(error && typeof error === 'object' && 'code' in error) || error.code !== 'EEXIST') {
+        throw error;
+      }
+    }
+
+    const existing = readServeLock(lockPath);
+    if (!existing) {
+      // Released between the create attempt and the read.
+      continue;
+    }
+    const holderPid = existing.payload?.pid;
+    const holderAlive = Boolean(holderPid && isProcessAlive(holderPid));
+    // A stale lock from a dead process is reclaimed, then the exclusive create
+    // is retried so two reclaiming processes cannot both believe they won.
+    if (holderAlive || !(await reclaimStaleLock(lockPath, existing.content))) {
+      if (Date.now() >= deadline) {
+        throw new Error(createI18n().t(busyMessageKey, {
+          lockPath,
+          pid: holderPid ?? '',
+        }));
+      }
+      await sleep(Math.max(1, retryIntervalMs));
+    }
+  }
+}
+
+// Several waiters can find the same dead owner at once. Deleting the file
+// outright would let a slow waiter delete the lock a faster one has just
+// published, and both would go ahead. So a waiter first claims a marker named
+// after the exact stale content, and deletes the lock only if it still holds
+// that content. Nothing can replace it in between: its owner is dead and every
+// other waiter needs the same marker. Returns false while another live waiter
+// holds the marker.
+async function reclaimStaleLock(lockPath: string, staleContent: string): Promise<boolean> {
+  const digest = crypto.createHash('sha256').update(staleContent).digest('hex').slice(0, 16);
+  const markerPath = `${lockPath}.reclaim-${digest}`;
+  let marker: ServeLock;
   try {
-    return await createServeLock(lockPath);
+    marker = await createServeLock(markerPath);
   } catch (error) {
     if (!(error && typeof error === 'object' && 'code' in error) || error.code !== 'EEXIST') {
       throw error;
     }
+    const holder = readServeLock(markerPath);
+    if (!holder) {
+      return true;
+    }
+    if (holder.payload?.pid && isProcessAlive(holder.payload.pid)) {
+      return false;
+    }
+    // The waiter holding the marker died mid-way; clear its marker the same way.
+    return reclaimStaleLock(markerPath, holder.content);
   }
-
-  const existing = readServeLock(lockPath);
-  if (existing?.pid && isProcessAlive(existing.pid)) {
-    throw new Error(createI18n().t('cli.lock.alreadyRunning', {
-      lockPath,
-      pid: existing.pid,
-    }));
+  try {
+    if (readServeLock(lockPath)?.content === staleContent) {
+      await fsp.rm(lockPath, { force: true });
+    }
+  } finally {
+    await marker.release();
   }
+  return true;
+}
 
-  await fsp.rm(lockPath, { force: true });
-  return createServeLock(lockPath);
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function createServeLock(lockPath: string): Promise<ServeLock> {
-  const handle = await fsp.open(lockPath, 'wx');
   const payload: ServeLockPayload = {
     pid: process.pid,
     startedAt: new Date().toISOString(),
     cwd: process.cwd(),
+    token: crypto.randomUUID(),
   };
-  await handle.writeFile(`${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  // Stage the payload first, then publish it with link(), which fails with
+  // EEXIST when the lock is already held. Creating the lock file empty and
+  // filling it afterwards would let a competitor read an owner-less file and
+  // reclaim it as stale while the first holder is still starting up.
+  const stagingPath = `${lockPath}.${process.pid}.${randomFileSuffix()}.staging`;
+  await fsp.writeFile(stagingPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  try {
+    await fsp.link(stagingPath, lockPath);
+  } finally {
+    try {
+      await fsp.rm(stagingPath, { force: true });
+    } catch {}
+  }
   let released = false;
 
   return {
@@ -755,9 +1078,6 @@ async function createServeLock(lockPath: string): Promise<ServeLock> {
         return;
       }
       released = true;
-      try {
-        await handle.close();
-      } catch {}
       await fsp.rm(lockPath, { force: true });
     },
     releaseSync() {
@@ -766,23 +1086,32 @@ async function createServeLock(lockPath: string): Promise<ServeLock> {
       }
       released = true;
       try {
-        handle.close().catch(() => {});
-      } catch {}
-      try {
         fs.rmSync(lockPath, { force: true });
       } catch {}
     },
   };
 }
 
-function readServeLock(lockPath: string): ServeLockPayload | null {
-  if (!fs.existsSync(lockPath)) {
-    return null;
+function randomFileSuffix() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+// Returns null only when the file does not exist. Unparseable content still
+// comes back, with a null payload, so it can be reclaimed as stale.
+function readServeLock(lockPath: string): ServeLockFile | null {
+  let content: string;
+  try {
+    content = fs.readFileSync(lockPath, 'utf8');
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
   }
   try {
-    return JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    return { content, payload: JSON.parse(content) };
   } catch {
-    return null;
+    return { content, payload: null };
   }
 }
 
@@ -949,9 +1278,55 @@ function printUsage() {
     createI18n().t('cli.usage.login'),
     createI18n().t('cli.usage.clearContext'),
     createI18n().t('cli.usage.serve'),
+    createI18n().t('cli.usage.send'),
     createI18n().t('cli.usage.cleanupInternalThreads'),
     createI18n().t('cli.usage.nativeApiServe'),
   ].join('\n'));
+}
+
+function readWeixinOutboundReceipts(filePath: string): Record<string, WeixinOutboundReceipt> {
+  // The receipts are the only record of which keys already went out. Reading a
+  // damaged or unreadable file as empty would let this run send again and then
+  // overwrite the file, dropping every other key with it, so only a missing
+  // file counts as empty.
+  let raw: string;
+  try {
+    raw = fs.readFileSync(filePath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      return {};
+    }
+    throw new Error(createI18n().t('cli.send.receiptsUnreadable', {
+      receiptsFile: filePath,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(createI18n().t('cli.send.receiptsUnreadable', {
+      receiptsFile: filePath,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(createI18n().t('cli.send.receiptsUnreadable', {
+      receiptsFile: filePath,
+      error: 'not a JSON object',
+    }));
+  }
+  return parsed as Record<string, WeixinOutboundReceipt>;
+}
+
+async function writeWeixinOutboundReceipts(
+  filePath: string,
+  receipts: Record<string, WeixinOutboundReceipt>,
+) {
+  await fsp.mkdir(path.dirname(filePath), { recursive: true });
+  const temporaryPath = `${filePath}.${process.pid}.${randomFileSuffix()}.tmp`;
+  await fsp.writeFile(temporaryPath, `${JSON.stringify(receipts, null, 2)}\n`, 'utf8');
+  await fsp.rename(temporaryPath, filePath);
 }
 
 function resolveClearContextAccountId({
@@ -1113,7 +1488,9 @@ export {
   resolveEmbeddedCodexNativeApiOptions,
   parseWeixinClearContextArgs,
   parseWeixinLoginArgs,
+  parseWeixinSendArgs,
   parseWeixinServeArgs,
   readPendingRestartNotifications,
   resolveClearContextAccountId,
+  runWeixinSend,
 };
