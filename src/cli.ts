@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -49,6 +50,7 @@ interface WeixinSendPlatformPlugin {
     externalScopeId: string;
     content: string;
     skipDeliveryCount?: number;
+    clientIdSeed?: string;
   }): Promise<{
     success: boolean;
     error?: string | null;
@@ -65,6 +67,8 @@ interface WeixinOutboundReceipt {
   status?: 'sent' | 'partial';
   deliveredDeliveryCount?: number;
   totalDeliveryCount?: number;
+  /** SHA-256 of the text the delivery counts refer to. */
+  contentSha256?: string;
 }
 
 interface WeixinSendDependencies {
@@ -105,6 +109,13 @@ interface ServeLockPayload {
   pid: number;
   startedAt: string;
   cwd: string;
+  /** Random per acquisition, so no two lock files ever have the same content. */
+  token?: string;
+}
+
+interface ServeLockFile {
+  content: string;
+  payload: ServeLockPayload | null;
 }
 
 interface ServeLock {
@@ -255,6 +266,7 @@ async function runWeixinSend(
   if (!content.trim()) {
     throw new Error(i18n.t('cli.send.emptyTextFile', { textFile }));
   }
+  const contentSha256 = crypto.createHash('sha256').update(content).digest('hex');
 
   const receiptsFile = path.join(stateDir, 'runtime', 'weixin-outbound-receipts.json');
   const receiptKey = `${toUserId}:${idempotencyKey}`;
@@ -273,6 +285,16 @@ async function runWeixinSend(
     if (receipt && receipt.status !== 'partial') {
       process.stdout.write(`${i18n.t('cli.send.skipped', { idempotencyKey })}\n`);
       return;
+    }
+    // A partial receipt counts segments of the text it was written for. Applied
+    // to an edited or regenerated file it would skip the wrong segments and
+    // splice the old beginning onto the new ending, so only the same text may
+    // resume it.
+    if (receipt && receipt.contentSha256 !== contentSha256) {
+      throw new Error(i18n.t('cli.send.partialContentChanged', {
+        idempotencyKey,
+        deliveredDeliveryCount: Math.max(0, Math.trunc(Number(receipt.deliveredDeliveryCount ?? 0))),
+      }));
     }
 
     // A long message goes out in several segments. When an earlier run got part
@@ -295,10 +317,15 @@ async function runWeixinSend(
     });
     await platformPlugin.start();
     try {
+      // Segment client ids come from the key and the text rather than at random.
+      // A segment Weixin accepted but whose reply timed out is not counted as
+      // delivered, so the next run sends it again; with the same id as before
+      // it reads as a repeat of that request, not as a second message.
       const result = await platformPlugin.sendText({
         externalScopeId: toUserId,
         content,
         skipDeliveryCount: alreadyDelivered,
+        clientIdSeed: `${receiptKey}\n${contentSha256}`,
       });
       const deliveredTotal = alreadyDelivered
         + Math.max(0, Math.trunc(Number(result?.deliveredCount ?? 0)));
@@ -311,6 +338,7 @@ async function runWeixinSend(
           status,
           deliveredDeliveryCount: deliveredTotal,
           totalDeliveryCount: result?.totalDeliveryCount,
+          contentSha256,
         },
       });
 
@@ -906,21 +934,61 @@ async function acquireServeLock(lockPath: string, {
     }
 
     const existing = readServeLock(lockPath);
-    if (existing?.pid && isProcessAlive(existing.pid)) {
+    if (!existing) {
+      // Released between the create attempt and the read.
+      continue;
+    }
+    const holderPid = existing.payload?.pid;
+    const holderAlive = Boolean(holderPid && isProcessAlive(holderPid));
+    // A stale lock from a dead process is reclaimed, then the exclusive create
+    // is retried so two reclaiming processes cannot both believe they won.
+    if (holderAlive || !(await reclaimStaleLock(lockPath, existing.content))) {
       if (Date.now() >= deadline) {
         throw new Error(createI18n().t(busyMessageKey, {
           lockPath,
-          pid: existing.pid,
+          pid: holderPid ?? '',
         }));
       }
       await sleep(Math.max(1, retryIntervalMs));
-      continue;
     }
-
-    // Stale lock from a dead process: drop it and retry the exclusive create so
-    // two reclaiming processes cannot both believe they won.
-    await fsp.rm(lockPath, { force: true });
   }
+}
+
+// Several waiters can find the same dead owner at once. Deleting the file
+// outright would let a slow waiter delete the lock a faster one has just
+// published, and both would go ahead. So a waiter first claims a marker named
+// after the exact stale content, and deletes the lock only if it still holds
+// that content. Nothing can replace it in between: its owner is dead and every
+// other waiter needs the same marker. Returns false while another live waiter
+// holds the marker.
+async function reclaimStaleLock(lockPath: string, staleContent: string): Promise<boolean> {
+  const digest = crypto.createHash('sha256').update(staleContent).digest('hex').slice(0, 16);
+  const markerPath = `${lockPath}.reclaim-${digest}`;
+  let marker: ServeLock;
+  try {
+    marker = await createServeLock(markerPath);
+  } catch (error) {
+    if (!(error && typeof error === 'object' && 'code' in error) || error.code !== 'EEXIST') {
+      throw error;
+    }
+    const holder = readServeLock(markerPath);
+    if (!holder) {
+      return true;
+    }
+    if (holder.payload?.pid && isProcessAlive(holder.payload.pid)) {
+      return false;
+    }
+    // The waiter holding the marker died mid-way; clear its marker the same way.
+    return reclaimStaleLock(markerPath, holder.content);
+  }
+  try {
+    if (readServeLock(lockPath)?.content === staleContent) {
+      await fsp.rm(lockPath, { force: true });
+    }
+  } finally {
+    await marker.release();
+  }
+  return true;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -934,6 +1002,7 @@ async function createServeLock(lockPath: string): Promise<ServeLock> {
     pid: process.pid,
     startedAt: new Date().toISOString(),
     cwd: process.cwd(),
+    token: crypto.randomUUID(),
   };
   // Stage the payload first, then publish it with link(), which fails with
   // EEXIST when the lock is already held. Creating the lock file empty and
@@ -975,14 +1044,22 @@ function randomFileSuffix() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function readServeLock(lockPath: string): ServeLockPayload | null {
-  if (!fs.existsSync(lockPath)) {
-    return null;
+// Returns null only when the file does not exist. Unparseable content still
+// comes back, with a null payload, so it can be reclaimed as stale.
+function readServeLock(lockPath: string): ServeLockFile | null {
+  let content: string;
+  try {
+    content = fs.readFileSync(lockPath, 'utf8');
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
   }
   try {
-    return JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    return { content, payload: JSON.parse(content) };
   } catch {
-    return null;
+    return { content, payload: null };
   }
 }
 

@@ -239,15 +239,21 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
     };
   }
 
-  buildTextDeliveries({ externalScopeId, content }: { externalScopeId: string; content: string }): WeixinTextDelivery[] {
+  buildTextDeliveries({ externalScopeId, content, clientIdSeed = null }: {
+    externalScopeId: string;
+    content: string;
+    clientIdSeed?: string | null;
+  }): WeixinTextDelivery[] {
     const contextToken = getStoredContextToken(this.config.accountsDir, this.config.accountId, externalScopeId);
-    return splitWeixinText(formatWeixinText(content), this.config.maxMessageLength).map((text) => ({
+    return splitWeixinText(formatWeixinText(content), this.config.maxMessageLength).map((text, index) => ({
       kind: 'weixin.sendmessage',
       payload: buildTextMessageReq({
         to: externalScopeId,
         text,
         contextToken,
-        clientId: `codexbridge-weixin-${crypto.randomUUID()}`,
+        clientId: clientIdSeed
+          ? deriveWeixinClientId(clientIdSeed, index)
+          : `codexbridge-weixin-${crypto.randomUUID()}`,
       }) as WeixinTextDelivery['payload'],
     }));
   }
@@ -404,10 +410,11 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
     return { path: filePath };
   }
 
-  async sendText({ externalScopeId, content, skipDeliveryCount = 0 }: {
+  async sendText({ externalScopeId, content, skipDeliveryCount = 0, clientIdSeed = null }: {
     externalScopeId: string;
     content: string;
     skipDeliveryCount?: number;
+    clientIdSeed?: string | null;
   }) {
     if (!this.client) {
       return {
@@ -435,6 +442,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
     const deliveries = this.buildTextDeliveries({
       externalScopeId,
       content,
+      clientIdSeed,
     });
     // Resume from the caller's offset. The split always runs over the full
     // content, so the boundaries match the earlier attempt and the skipped
@@ -974,6 +982,13 @@ function extractWeixinErrorCode(error: unknown): number | null {
 
 function joinDeliveredTexts(chunks: string[]) {
   return Array.isArray(chunks) ? chunks.filter(Boolean).join('\n\n').trim() : '';
+}
+
+// The same seed and index always give the same client id, shaped like the
+// random ones, so a later run repeating a segment reuses its earlier id.
+function deriveWeixinClientId(seed: string, index: number) {
+  const hex = crypto.createHash('sha256').update(`${seed}\n${index}`).digest('hex');
+  return `codexbridge-weixin-${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
 function stringValue(value: unknown) {

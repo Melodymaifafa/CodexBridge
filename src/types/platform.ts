@@ -75,6 +75,11 @@ export interface PlatformPluginContract {
      * rather than the leftover text.
      */
     skipDeliveryCount?: number;
+    /**
+     * Derives each delivery's client id from this seed and its index instead of
+     * at random, so a later attempt at the same delivery reuses the same id.
+     */
+    clientIdSeed?: string | null;
   }): Promise<PlatformTextDeliveryResult | null | undefined>;
   sendTyping?(params: {
     externalScopeId: string;

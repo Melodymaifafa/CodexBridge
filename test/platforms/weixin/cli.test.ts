@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -31,20 +32,24 @@ function weixinSendTestPlugin({
   delivered,
   failOnDeliveryIndex = null,
   sendDelayMs = 0,
+  clientIdSeeds = [],
 }: {
   delivered: string[];
   failOnDeliveryIndex?: number | null;
   sendDelayMs?: number;
+  clientIdSeeds?: Array<string | undefined>;
 }) {
   const failedOnce = new Set<number>();
   return () => ({
     async start() {},
     async stop() {},
-    async sendText({ content, skipDeliveryCount = 0 }: {
+    async sendText({ content, skipDeliveryCount = 0, clientIdSeed }: {
       externalScopeId: string;
       content: string;
       skipDeliveryCount?: number;
+      clientIdSeed?: string;
     }) {
+      clientIdSeeds.push(clientIdSeed);
       const chunks = content.split(CHUNK_SEPARATOR);
       if (sendDelayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, sendDelayMs));
@@ -145,9 +150,10 @@ test('weixin send resumes after a partial chunked delivery instead of re-sending
     '--text-file', digestPath,
     '--idempotency-key', 'linear-digest-2026-10-08',
   ];
+  const clientIdSeeds: Array<string | undefined> = [];
   // The second segment fails on the first run, so only the first is delivered.
   const dependencies = {
-    createPlatformPlugin: weixinSendTestPlugin({ delivered, failOnDeliveryIndex: 1 }),
+    createPlatformPlugin: weixinSendTestPlugin({ delivered, failOnDeliveryIndex: 1, clientIdSeeds }),
   };
 
   await assert.rejects(() => runWeixinSend(args, dependencies), /transport unavailable/);
@@ -164,6 +170,38 @@ test('weixin send resumes after a partial chunked delivery instead of re-sending
   const final = weixinSendReceipts(tmpDir)['melody@im.wechat:linear-digest-2026-10-08'];
   assert.equal(final.status, 'sent');
   assert.equal(final.deliveredDeliveryCount, 3);
+  // The retried segment goes out under the client ids of the first run.
+  assert.equal(clientIdSeeds.length, 2);
+  assert.ok(clientIdSeeds[0]);
+  assert.equal(clientIdSeeds[1], clientIdSeeds[0]);
+});
+
+test('weixin send refuses to resume a partial delivery once the text file has changed', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-send-changed-'));
+  const digestPath = path.join(tmpDir, 'digest.md');
+  const delivered: string[] = [];
+  fs.writeFileSync(digestPath, ['第一段', '第二段', '第三段'].join(CHUNK_SEPARATOR), 'utf8');
+
+  const args = [
+    '--state-dir', tmpDir,
+    '--to-user-id', 'melody@im.wechat',
+    '--text-file', digestPath,
+    '--idempotency-key', 'linear-digest-2026-10-09',
+  ];
+  const dependencies = {
+    createPlatformPlugin: weixinSendTestPlugin({ delivered, failOnDeliveryIndex: 1 }),
+  };
+
+  await assert.rejects(() => runWeixinSend(args, dependencies), /transport unavailable/);
+  assert.deepEqual(delivered, ['第一段']);
+
+  // Regenerated before the retry: skipping one segment of this text would
+  // splice the old opening onto the new rest.
+  fs.writeFileSync(digestPath, ['新第一段', '新第二段'].join(CHUNK_SEPARATOR), 'utf8');
+  await assert.rejects(() => runWeixinSend(args, dependencies), /idempotency key|幂等键/);
+
+  assert.deepEqual(delivered, ['第一段']);
+  assert.equal(weixinSendReceipts(tmpDir)['melody@im.wechat:linear-digest-2026-10-09'].status, 'partial');
 });
 
 test('weixin send treats a receipt written before chunk tracking as fully sent', async () => {
@@ -444,6 +482,54 @@ test('acquireServeLock recovers a stale lock file', async () => {
 
   assert.equal(payload.pid, process.pid);
 
+  await lock.release();
+});
+
+test('acquireServeLock lets only one of two callers reclaim the same stale lock', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-lock-reclaim-'));
+  const lockPath = path.join(tmpDir, 'runtime', 'weixin-send.lock');
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  fs.writeFileSync(lockPath, JSON.stringify({
+    pid: 999999,
+    startedAt: new Date().toISOString(),
+    cwd: '/tmp/stale',
+  }));
+
+  // Both callers see the same dead owner. The slower one must not delete the
+  // lock the faster one has just published in its place.
+  const outcomes = await Promise.allSettled([
+    acquireServeLock(lockPath),
+    acquireServeLock(lockPath),
+  ]);
+
+  const winners = outcomes.filter((outcome) => outcome.status === 'fulfilled');
+  assert.equal(winners.length, 1);
+  for (const winner of winners) {
+    await (winner as PromiseFulfilledResult<{ release(): Promise<void> }>).value.release();
+  }
+});
+
+test('acquireServeLock recovers a stale lock whose reclaimer also died', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-lock-reclaimer-'));
+  const lockPath = path.join(tmpDir, 'runtime', 'weixin-send.lock');
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  const staleContent = JSON.stringify({
+    pid: 999999,
+    startedAt: new Date().toISOString(),
+    cwd: '/tmp/stale',
+  });
+  fs.writeFileSync(lockPath, staleContent);
+  const digest = crypto.createHash('sha256').update(staleContent).digest('hex').slice(0, 16);
+  fs.writeFileSync(`${lockPath}.reclaim-${digest}`, JSON.stringify({
+    pid: 999998,
+    startedAt: new Date().toISOString(),
+    cwd: '/tmp/stale',
+  }));
+
+  const lock = await acquireServeLock(lockPath);
+
+  assert.equal(JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid, process.pid);
+  assert.equal(fs.existsSync(`${lockPath}.reclaim-${digest}`), false);
   await lock.release();
 });
 
