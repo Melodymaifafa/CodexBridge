@@ -1,6 +1,7 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 
 const distTestDir = path.join(process.cwd(), 'dist', 'test');
 fs.rmSync(distTestDir, { recursive: true, force: true });
@@ -73,16 +74,30 @@ const testArgs =
       ? importedEntryArgs
       : collectTestFiles(path.join(process.cwd(), 'test'));
 
-const result = spawnSync(process.execPath, ['--import', 'tsx', '--test', ...testArgs], {
+// Run in CI's time zone and a throwaway home, so results do not depend on
+// this machine and turn artifacts never land in the real ~/.codexbridge.
+const testHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-test-'));
+isolatedEnv.TZ = 'UTC';
+isolatedEnv.HOME = testHome;
+isolatedEnv.USERPROFILE = testHome;
+
+const child = spawn(process.execPath, ['--import', 'tsx', '--test', ...testArgs], {
   env: isolatedEnv,
   stdio: 'inherit',
 });
-
-if (typeof result.status === 'number') {
-  process.exit(result.status);
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => child.kill(signal));
 }
+child.on('error', (error) => {
+  console.error(error);
+  finish(1);
+});
+child.on('exit', (code) => finish(typeof code === 'number' ? code : 1));
 
-process.exit(1);
+function finish(code) {
+  fs.rmSync(testHome, { recursive: true, force: true });
+  process.exit(code);
+}
 
 function loadOptionalEnvFile(filePath) {
   if (!filePath) {
