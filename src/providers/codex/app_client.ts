@@ -280,6 +280,11 @@ interface ProgressState {
   lastAssistantActivityAt: number;
 }
 
+interface TurnWaitListeners {
+  onNotification: (notification: any) => void;
+  onApprovalEvent: (request: ProviderApprovalRequest) => void;
+}
+
 type CodexAppServerTransport = 'auto' | 'websocket' | 'stdio';
 
 interface CodexAppClientOptions {
@@ -358,6 +363,8 @@ export class CodexAppClient extends EventEmitter {
 
   approvedExecutions: Map<string, ApprovedExecution>;
 
+  turnWaits: Set<TurnWaitListeners>;
+
   requestId: number;
 
   port: number | null;
@@ -415,6 +422,7 @@ export class CodexAppClient extends EventEmitter {
     this.pending = new Map();
     this.pendingApprovals = new Map();
     this.approvedExecutions = new Map();
+    this.turnWaits = new Set();
     this.requestId = 0;
     this.port = null;
     this.connected = false;
@@ -1692,6 +1700,35 @@ export class CodexAppClient extends EventEmitter {
     }
   }
 
+  // All turn waits share one listener per event, so concurrent turns never pile up past the emitter limit.
+  addTurnWait(turnWait: TurnWaitListeners): void {
+    if (this.turnWaits.size === 0) {
+      this.on('notification', this.dispatchTurnWaitNotification);
+      this.on('approval_request', this.dispatchTurnWaitApprovalEvent);
+    }
+    this.turnWaits.add(turnWait);
+  }
+
+  removeTurnWait(turnWait: TurnWaitListeners): void {
+    if (!this.turnWaits.delete(turnWait) || this.turnWaits.size > 0) {
+      return;
+    }
+    this.off('notification', this.dispatchTurnWaitNotification);
+    this.off('approval_request', this.dispatchTurnWaitApprovalEvent);
+  }
+
+  dispatchTurnWaitNotification = (notification: any): void => {
+    for (const turnWait of this.turnWaits) {
+      turnWait.onNotification(notification);
+    }
+  };
+
+  dispatchTurnWaitApprovalEvent = (request: ProviderApprovalRequest): void => {
+    for (const turnWait of this.turnWaits) {
+      turnWait.onApprovalEvent(request);
+    }
+  };
+
   async waitForTurnResult({
     threadId,
     turnId,
@@ -1783,8 +1820,7 @@ export class CodexAppClient extends EventEmitter {
         void onApprovalRequest(request);
       }
     };
-    this.on('notification', onNotification);
-    this.on('approval_request', onApprovalEvent);
+    const turnWait: TurnWaitListeners = { onNotification, onApprovalEvent };
     this.logDebug('turn_wait_start', {
       threadId,
       turnId,
@@ -1793,6 +1829,7 @@ export class CodexAppClient extends EventEmitter {
       terminalSettleMs,
     });
     try {
+      this.addTurnWait(turnWait);
       while (true) {
         const pendingApprovalCount = this.getPendingApprovals({ threadId, turnId }).length;
         const pastDeadline = this.turnPollNow() >= deadline;
@@ -2301,8 +2338,7 @@ export class CodexAppClient extends EventEmitter {
       throw new Error(`Timed out waiting for Codex turn ${turnId}`);
     } finally {
       this.clearApprovedExecutionsForTurn({ threadId, turnId });
-      this.off('notification', onNotification);
-      this.off('approval_request', onApprovalEvent);
+      this.removeTurnWait(turnWait);
     }
   }
 }
