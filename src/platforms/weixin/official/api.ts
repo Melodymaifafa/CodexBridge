@@ -1,4 +1,5 @@
 import { createI18n } from '../../../i18n/index.js';
+import { writeSequencedDebugLog } from '../../../core/sequenced_stderr.js';
 import dns from 'node:dns/promises';
 import https from 'node:https';
 import type {
@@ -518,8 +519,5 @@ function previewResponse(raw: string, maxLength = 200) {
 }
 
 function debugWeixinHttp(event: string, payload: Record<string, unknown>) {
-  if (process.env.CODEXBRIDGE_DEBUG_WEIXIN !== '1') {
-    return;
-  }
-  process.stderr.write(`[weixin-http] ${event} ${JSON.stringify(payload)}\n`);
+  writeSequencedDebugLog('weixin-http', event, payload);
 }
