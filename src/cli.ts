@@ -20,6 +20,11 @@ import { OpenAINativeProviderPlugin } from './providers/openai_native/plugin.js'
 import { OpenAICompatibleProviderPlugin } from './providers/openai_compatible/plugin.js';
 import { WeixinBridgeRuntime } from './runtime/weixin_bridge_runtime.js';
 import { createI18n } from './i18n/index.js';
+import {
+  captureProcessWarningsInSequencedStderr,
+  flushSequencedStderr,
+  writeSequencedStderrError,
+} from './core/sequenced_stderr.js';
 
 const CLI_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(CLI_FILE), '..');
@@ -413,6 +418,7 @@ async function runWeixinSend(
 }
 
 async function runWeixinServe(args: string[]) {
+  captureProcessWarningsInSequencedStderr();
   const i18n = createI18n();
   const options = parseWeixinServeArgs(args);
   const stateDir = path.resolve(options.stateDir ?? defaultCodexBridgeStateDir());
@@ -454,7 +460,7 @@ async function runWeixinServe(args: string[]) {
     agentJobs: runtime.services.agentJobs,
     assistantRecords: runtime.services.assistantRecords,
     onError: (async (error: unknown) => {
-      process.stderr.write(`[weixin] ${formatError(error)}\n`);
+      writeSequencedStderrError('[weixin]', error);
     }) as any,
     locale: i18n.locale,
   } as any);
@@ -496,6 +502,7 @@ async function runWeixinServe(args: string[]) {
       return;
     }
     stopped = true;
+    flushSequencedStderr();
     process.stdout.write(`${i18n.t('cli.serve.stopping', { signal })}\n`);
     try {
       await bridgeRuntime.stop();
@@ -1360,13 +1367,6 @@ function createWeixinServeCodexGoalManager(stateDir: string) {
 
 async function stopRuntimeProviderPlugins(providerPlugins: any[]) {
   await Promise.allSettled(providerPlugins.map((plugin) => plugin?.stop?.()));
-}
-
-function formatError(error: unknown) {
-  if (error instanceof Error) {
-    return error.stack || error.message;
-  }
-  return String(error);
 }
 
 function normalizeCliString(value: unknown): string | null {
