@@ -255,6 +255,11 @@ Important clarification:
 - `previous_response_id` continuation must stay pinned to the original native
   provider/account identity; if that affinity breaks, the localhost API should
   fail loudly instead of silently rehoming the chain
+- an isolated thread is released (`thread/unsubscribe`) once nothing can use it
+  again: right after a one-shot turn (side tasks, chat completions,
+  `store: false`, failed turns), or when the last continuation entry that points
+  at it expires; the app-server then unloads it, with its MCP servers and
+  `node_repl`, after `thread_unload_delay_secs` (60 s by default)
 
 ### Lane C: External fallback lane
 

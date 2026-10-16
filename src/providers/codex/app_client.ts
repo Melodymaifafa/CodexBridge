@@ -518,6 +518,12 @@ export class CodexAppClient extends EventEmitter {
     await this.request('thread/unarchive', { threadId }, { timeoutMs: 30_000 });
   }
 
+  // Drops this connection's subscription; the app-server unloads the thread (and its MCP / node_repl
+  // children) once no subscriber is left. An ephemeral thread cannot be loaded again afterwards.
+  async unsubscribeThread(threadId: string): Promise<void> {
+    await this.request('thread/unsubscribe', { threadId }, { timeoutMs: 10_000 });
+  }
+
   async startThread({
     cwd = null,
     title = null,
