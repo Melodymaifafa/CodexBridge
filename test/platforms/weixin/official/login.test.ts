@@ -57,3 +57,56 @@ test('officialQrLogin follows confirmed QR flow and persists credentials', async
   assert.equal(accountStore.loadAccount('bot-account')?.token, 'bot-token');
   assert.equal(accountStore.getContextToken('bot-account', 'wxid_sender'), null);
 });
+
+function networkError(code: string): Error {
+  return Object.assign(new Error(`connect ${code}`), { code });
+}
+
+test('officialQrLogin keeps polling when a status poll times out', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-login-'));
+  const accountStore = new WeixinAccountStore({ rootDir: tmpDir });
+  const fetchImpl = createFetchMock([
+    { body: { qrcode: 'qr-1', qrcode_img_content: 'https://qr.example.com' } },
+    { error: networkError('ETIMEDOUT') },
+    { error: networkError('ECONNRESET') },
+    {
+      body: {
+        status: 'confirmed',
+        ilink_bot_id: 'bot-account',
+        bot_token: 'bot-token',
+        baseurl: 'https://ilink.example.com',
+        ilink_user_id: 'wx-user',
+      },
+    },
+  ]);
+
+  const credentials = await officialQrLogin({
+    accountStore,
+    accountsDir: tmpDir,
+    fetchImpl,
+    timeoutSeconds: 1,
+    sleep: async () => {},
+  });
+
+  assert.equal(credentials?.account_id, 'bot-account');
+});
+
+test('officialQrLogin still fails on a non-network status poll error', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-weixin-login-'));
+  const accountStore = new WeixinAccountStore({ rootDir: tmpDir });
+  const fetchImpl = createFetchMock([
+    { body: { qrcode: 'qr-1', qrcode_img_content: 'https://qr.example.com' } },
+    { error: new Error('boom') },
+  ]);
+
+  await assert.rejects(
+    officialQrLogin({
+      accountStore,
+      accountsDir: tmpDir,
+      fetchImpl,
+      timeoutSeconds: 1,
+      sleep: async () => {},
+    }),
+    /boom/,
+  );
+});

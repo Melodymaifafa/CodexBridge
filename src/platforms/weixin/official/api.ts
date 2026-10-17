@@ -459,7 +459,7 @@ function requestJsonOverHttpsAddress({
   });
 }
 
-function isRetryableNetworkError(error: unknown): boolean {
+export function isRetryableNetworkError(error: unknown): boolean {
   const code = typeof error === 'object' && error && 'code' in error
     ? String((error as { code?: unknown }).code ?? '')
     : '';
