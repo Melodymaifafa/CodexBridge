@@ -1,5 +1,5 @@
 import { createI18n } from '../../../i18n/index.js';
-import { getBotQr, getQrStatus, type WeixinOfficialFetch } from './api.js';
+import { getBotQr, getQrStatus, isRetryableNetworkError, type WeixinOfficialFetch } from './api.js';
 import type { WeixinQrCodeResponse, WeixinQrStatusResponse } from './types.js';
 import { clearContextTokensForAccount } from './context_tokens.js';
 import type { WeixinAccountStore } from '../account_store.js';
@@ -79,7 +79,8 @@ export async function officialQrLogin(
         qrcode,
       });
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
+      // A status long-poll that times out or drops only means "no scan yet": keep waiting until the deadline.
+      if ((error instanceof Error && error.name === 'AbortError') || isRetryableNetworkError(error)) {
         await sleep(1000);
         continue;
       }
