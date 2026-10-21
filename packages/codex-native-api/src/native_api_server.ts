@@ -30,6 +30,14 @@ export interface CodexNativeApiRuntimeContext {
   authPathOrOptions?: AuthPathOrOptions;
 }
 
+// A /v1/responses thread stays loaded while a continuation entry can still resume it.
+interface RetainedNativeThread {
+  providerProfile: ProviderProfile;
+  providerPlugin: ProviderPluginContract | null | undefined;
+  responseIds: Set<string>;
+  activeTurns: number;
+}
+
 export interface CodexNativeApiServerOptions {
   runtime?: CodexNativeRuntime;
   resolveRuntimeContext: () => CodexNativeApiRuntimeContext | Promise<CodexNativeApiRuntimeContext>;
@@ -51,6 +59,7 @@ export interface CodexNativeApiServerOptions {
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_TITLE_PREFIX = 'Codex Native API';
 const DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024;
+const RETAINED_THREAD_SWEEP_INTERVAL_MS = 60_000;
 
 interface ResponsesStreamReasoningState {
   id: string;
@@ -132,6 +141,10 @@ export class CodexNativeApiServer {
 
   private startedUrl: string | null;
 
+  private readonly retainedThreads = new Map<string, RetainedNativeThread>();
+
+  private retainedThreadSweepTimer: NodeJS.Timeout | null = null;
+
   constructor({
     runtime = new CodexNativeRuntime(),
     resolveRuntimeContext,
@@ -207,6 +220,10 @@ export class CodexNativeApiServer {
         const address = this.server?.address();
         const port = typeof address === 'object' && address ? address.port : this.requestedPort;
         this.startedUrl = `http://${this.host}:${port}`;
+        this.retainedThreadSweepTimer = setInterval(() => {
+          void this.releaseUnreferencedThreads();
+        }, RETAINED_THREAD_SWEEP_INTERVAL_MS);
+        this.retainedThreadSweepTimer.unref();
         resolve();
       };
       this.server?.once('error', onError);
@@ -216,6 +233,17 @@ export class CodexNativeApiServer {
   }
 
   async stop(): Promise<void> {
+    if (this.retainedThreadSweepTimer) {
+      clearInterval(this.retainedThreadSweepTimer);
+      this.retainedThreadSweepTimer = null;
+    }
+    const retainedThreads = [...this.retainedThreads.entries()];
+    this.retainedThreads.clear();
+    await Promise.all(retainedThreads.map(([threadId, retained]) => this.runtime.releaseThread({
+      providerProfile: retained.providerProfile,
+      providerPlugin: retained.providerPlugin,
+      threadId,
+    })));
     const server = this.server;
     this.server = null;
     this.startedUrl = null;
@@ -701,8 +729,11 @@ export class CodexNativeApiServer {
       return;
     }
 
+    const releaseThreadHold = this.holdRetainedThread(continuationEntry?.nativeThreadId, context);
+    let execution: CodexNativeRuntimeTurnResult | null = null;
+    let storedResponseId: string | null = null;
     try {
-      const execution = await this.executeResponsesTurn({
+      execution = await this.executeResponsesTurn({
         context,
         continuationEntry,
         responseId,
@@ -719,6 +750,7 @@ export class CodexNativeApiServer {
         serviceTier,
         developerInstructions: toolPreparation.developerInstructions,
         requestUser: normalizeNullableString(requestBody.user),
+        retainThread: true,
       });
       const outputText = normalizeString(execution.result.outputText);
       const previewText = normalizeString(execution.result.previewText);
@@ -749,19 +781,23 @@ export class CodexNativeApiServer {
       if (previousResponseId) {
         this.continuationRegistry.touch(previousResponseId);
       }
-      this.continuationRegistry.store({
-        responseId,
-        previousResponseId,
-        providerProfileId: context.providerProfile.id,
-        bridgeSession: execution.session,
-        nativeThreadId: execution.result.threadId ?? execution.session.codexThreadId,
-        nativeTurnId: execution.result.turnId ?? null,
-        activeAccountId: readiness.accountIdentity?.accountId ?? null,
-        model: effectiveModel,
-        routeKind: 'responses',
-        startedAt,
-        lastUsedAt: startedAt,
-      });
+      // `store: false` opts out of continuation, so the thread can be unloaded right away.
+      if (requestBody.store !== false) {
+        this.continuationRegistry.store({
+          responseId,
+          previousResponseId,
+          providerProfileId: context.providerProfile.id,
+          bridgeSession: execution.session,
+          nativeThreadId: execution.result.threadId ?? execution.session.codexThreadId,
+          nativeTurnId: execution.result.turnId ?? null,
+          activeAccountId: readiness.accountIdentity?.accountId ?? null,
+          model: effectiveModel,
+          routeKind: 'responses',
+          startedAt,
+          lastUsedAt: startedAt,
+        });
+        storedResponseId = responseId;
+      }
       writeJson(response, 200, buildResponsesObject({
         request: requestBody,
         responseId,
@@ -801,6 +837,11 @@ export class CodexNativeApiServer {
           readiness,
         }),
       });
+    } finally {
+      releaseThreadHold();
+      if (execution) {
+        this.settleRetainedThread(execution, storedResponseId, context);
+      }
     }
   }
 
@@ -824,6 +865,7 @@ export class CodexNativeApiServer {
     onProgress = null,
     onTurnStarted = null,
     routePath = '/v1/responses',
+    retainThread = false,
   }: {
     context: CodexNativeApiRuntimeContext;
     continuationEntry: CodexNativeApiContinuationEntry | null;
@@ -844,6 +886,7 @@ export class CodexNativeApiServer {
     onProgress?: ((progress: ProviderTurnProgress) => Promise<void> | void) | null;
     onTurnStarted?: ((meta: CodexNativeRuntimeTurnStartedMeta) => Promise<void> | void) | null;
     routePath?: string;
+    retainThread?: boolean;
   }): Promise<CodexNativeRuntimeTurnResult> {
     return continuationEntry
       ? this.runtime.continueIsolatedTurn({
@@ -893,6 +936,7 @@ export class CodexNativeApiServer {
         model: effectiveModel,
         reasoningEffort,
         serviceTier,
+        retainThread,
         onProgress,
         onTurnStarted,
         prepareTurn: (session) => ({
@@ -1002,8 +1046,11 @@ export class CodexNativeApiServer {
       }
     };
 
+    const releaseThreadHold = this.holdRetainedThread(continuationEntry?.nativeThreadId, context);
+    let execution: CodexNativeRuntimeTurnResult | null = null;
+    let storedResponseId: string | null = null;
     try {
-      const execution = await this.executeResponsesTurn({
+      execution = await this.executeResponsesTurn({
         context,
         continuationEntry,
         responseId,
@@ -1020,6 +1067,7 @@ export class CodexNativeApiServer {
         serviceTier,
         developerInstructions,
         requestUser: normalizeNullableString(request.user),
+        retainThread: true,
         onTurnStarted: (meta) => {
           latestTurnMeta = {
             threadId: meta.threadId,
@@ -1076,19 +1124,23 @@ export class CodexNativeApiServer {
       if (previousResponseId) {
         this.continuationRegistry.touch(previousResponseId);
       }
-      this.continuationRegistry.store({
-        responseId,
-        previousResponseId,
-        providerProfileId: context.providerProfile.id,
-        bridgeSession: execution.session,
-        nativeThreadId: execution.result.threadId ?? execution.session.codexThreadId,
-        nativeTurnId: execution.result.turnId ?? null,
-        activeAccountId: readiness.accountIdentity?.accountId ?? null,
-        model: effectiveModel,
-        routeKind: 'responses',
-        startedAt,
-        lastUsedAt: startedAt,
-      });
+      // `store: false` opts out of continuation, so the thread can be unloaded right away.
+      if (request.store !== false) {
+        this.continuationRegistry.store({
+          responseId,
+          previousResponseId,
+          providerProfileId: context.providerProfile.id,
+          bridgeSession: execution.session,
+          nativeThreadId: execution.result.threadId ?? execution.session.codexThreadId,
+          nativeTurnId: execution.result.turnId ?? null,
+          activeAccountId: readiness.accountIdentity?.accountId ?? null,
+          model: effectiveModel,
+          routeKind: 'responses',
+          startedAt,
+          lastUsedAt: startedAt,
+        });
+        storedResponseId = responseId;
+      }
       flushEvents(finishResponsesStreamState(streamState, {
         status: hasCompletedOutput ? 'completed' : 'incomplete',
         output: responseOutput,
@@ -1130,7 +1182,77 @@ export class CodexNativeApiServer {
         nativeTurnId: latestTurnMeta.turnId,
       }), nativeRuntime));
       finishSse(response);
+    } finally {
+      releaseThreadHold();
+      if (execution) {
+        this.settleRetainedThread(execution, storedResponseId, context);
+      }
     }
+  }
+
+  // Pins a thread while a continuation turn runs on it, so a sweep cannot unload it mid-turn.
+  private holdRetainedThread(
+    threadId: string | null | undefined,
+    context: CodexNativeApiRuntimeContext,
+  ): () => void {
+    if (!threadId) {
+      return () => {};
+    }
+    const retained = this.trackRetainedThread(threadId, context);
+    retained.activeTurns += 1;
+    return () => {
+      retained.activeTurns -= 1;
+    };
+  }
+
+  private settleRetainedThread(
+    execution: CodexNativeRuntimeTurnResult,
+    storedResponseId: string | null,
+    context: CodexNativeApiRuntimeContext,
+  ): void {
+    const retained = this.trackRetainedThread(
+      execution.result.threadId ?? execution.session.codexThreadId,
+      context,
+    );
+    if (storedResponseId) {
+      retained.responseIds.add(storedResponseId);
+    }
+    void this.releaseUnreferencedThreads();
+  }
+
+  private trackRetainedThread(threadId: string, context: CodexNativeApiRuntimeContext): RetainedNativeThread {
+    let retained = this.retainedThreads.get(threadId);
+    if (!retained) {
+      retained = {
+        providerProfile: context.providerProfile,
+        providerPlugin: context.providerPlugin,
+        responseIds: new Set(),
+        activeTurns: 0,
+      };
+      this.retainedThreads.set(threadId, retained);
+    }
+    return retained;
+  }
+
+  // Unloads every retained thread that no live continuation entry can resume any more.
+  private async releaseUnreferencedThreads(): Promise<void> {
+    const released: Array<[string, RetainedNativeThread]> = [];
+    for (const [threadId, retained] of this.retainedThreads) {
+      for (const responseId of retained.responseIds) {
+        if (this.continuationRegistry.lookup(responseId).status !== 'found') {
+          retained.responseIds.delete(responseId);
+        }
+      }
+      if (retained.activeTurns === 0 && retained.responseIds.size === 0) {
+        this.retainedThreads.delete(threadId);
+        released.push([threadId, retained]);
+      }
+    }
+    await Promise.all(released.map(([threadId, retained]) => this.runtime.releaseThread({
+      providerProfile: retained.providerProfile,
+      providerPlugin: retained.providerPlugin,
+      threadId,
+    })));
   }
 
   private async handleStreamingChatCompletions({

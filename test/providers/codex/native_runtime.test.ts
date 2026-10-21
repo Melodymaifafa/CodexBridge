@@ -436,3 +436,91 @@ test('CodexNativeRuntime reconnectProfiles aggregates errors and skips unsupport
   assert.deepEqual(failingSummary.errors, ['reconnect failed']);
   assert.equal(failingSummary.results.length, 0);
 });
+
+function makeOneShotPlugin({ failTurns = new Set<number>() }: { failTurns?: Set<number> } = {}) {
+  const unsubscribed: string[] = [];
+  let threadCount = 0;
+  let turnCount = 0;
+  const providerPlugin = {
+    async startThread() {
+      threadCount += 1;
+      return { threadId: `thread-one-shot-${threadCount}`, cwd: '/tmp/one-shot', title: 'One Shot' };
+    },
+    async startTurn(params: any) {
+      turnCount += 1;
+      if (failTurns.has(turnCount)) {
+        throw new Error(`turn ${turnCount} failed`);
+      }
+      return { outputText: 'ok', previewText: '', threadId: params.bridgeSession.codexThreadId };
+    },
+    async unsubscribeThread({ threadId }: { threadId: string }) {
+      unsubscribed.push(threadId);
+      if (threadId === 'thread-one-shot-unsubscribe-fails') {
+        throw new Error('unsubscribe failed');
+      }
+    },
+  } as any;
+  return { providerPlugin, unsubscribed };
+}
+
+function runOneShot(runtime: CodexNativeRuntime, providerPlugin: any, retainThread?: boolean) {
+  return runtime.runIsolatedTurn({
+    providerProfile: makeProfile(),
+    providerPlugin,
+    title: 'One Shot',
+    retainThread,
+    prepareTurn: (session) => ({
+      inputText: 'hello',
+      event: {
+        platform: 'codex-native-api',
+        externalScopeId: session.id,
+        text: 'hello',
+        cwd: session.cwd,
+        locale: null,
+        attachments: [],
+      },
+    }),
+  });
+}
+
+test('CodexNativeRuntime runIsolatedTurn unloads its one-shot thread after the turn succeeds or fails', async () => {
+  const runtime = new CodexNativeRuntime();
+  const { providerPlugin, unsubscribed } = makeOneShotPlugin({ failTurns: new Set([2]) });
+
+  const execution = await runOneShot(runtime, providerPlugin);
+  assert.equal(execution.result.outputText, 'ok');
+  assert.deepEqual(unsubscribed, ['thread-one-shot-1']);
+
+  await assert.rejects(runOneShot(runtime, providerPlugin), /turn 2 failed/);
+  assert.deepEqual(unsubscribed, ['thread-one-shot-1', 'thread-one-shot-2']);
+});
+
+test('CodexNativeRuntime runIsolatedTurn retainThread keeps a successful thread loaded but still unloads a failed one', async () => {
+  const runtime = new CodexNativeRuntime();
+  const { providerPlugin, unsubscribed } = makeOneShotPlugin({ failTurns: new Set([2]) });
+
+  await runOneShot(runtime, providerPlugin, true);
+  assert.deepEqual(unsubscribed, []);
+
+  await assert.rejects(runOneShot(runtime, providerPlugin, true), /turn 2 failed/);
+  assert.deepEqual(unsubscribed, ['thread-one-shot-2']);
+
+  await runtime.releaseThread({ providerProfile: makeProfile(), providerPlugin, threadId: 'thread-one-shot-1' });
+  assert.deepEqual(unsubscribed, ['thread-one-shot-2', 'thread-one-shot-1']);
+});
+
+test('CodexNativeRuntime releaseThread ignores unsubscribe errors and plugins without unsubscribe', async () => {
+  const runtime = new CodexNativeRuntime();
+  const { providerPlugin, unsubscribed } = makeOneShotPlugin();
+
+  await runtime.releaseThread({
+    providerProfile: makeProfile(),
+    providerPlugin,
+    threadId: 'thread-one-shot-unsubscribe-fails',
+  });
+  assert.deepEqual(unsubscribed, ['thread-one-shot-unsubscribe-fails']);
+
+  const { unsubscribeThread: _unused, ...pluginWithoutUnsubscribe } = providerPlugin;
+  const execution = await runOneShot(runtime, pluginWithoutUnsubscribe);
+  assert.equal(execution.result.outputText, 'ok');
+});

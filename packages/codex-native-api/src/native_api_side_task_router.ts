@@ -265,6 +265,8 @@ function buildNativeApiRequestBody(request: CodexNativeApiSideTaskRequest): Reco
     reasoning: request.reasoningEffort ? { effort: request.reasoningEffort } : undefined,
     service_tier: normalizeNullableString(request.serviceTier),
     metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+    // Side tasks never continue, so the server can unload the thread as soon as it answers.
+    store: false,
   });
 }
 

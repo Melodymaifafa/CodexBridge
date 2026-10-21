@@ -15,6 +15,15 @@ isolatedEnv[AGENT_COMMAND_ENV_FLAG] ??= '1';
 const allowLiveAgent = isolatedEnv[LIVE_AGENT_TEST_ENV_FLAG] === '1';
 const allowLiveOpenAICompatible = isolatedEnv[LIVE_OPENAI_COMPATIBLE_TEST_ENV_FLAG] === '1';
 
+if (!allowLiveAgent) {
+  // BridgeCoordinator routes side tasks to the native API, default 127.0.0.1:43182.
+  // On a machine running the real bridge, each test would start a real Codex thread
+  // that keeps its MCP servers and node_repl alive.
+  isolatedEnv.CODEX_NATIVE_API_ENABLE = '0';
+  delete isolatedEnv.CODEXBRIDGE_INTERNAL_NATIVE_API_ENABLED;
+  delete isolatedEnv.CODEXBRIDGE_INTERNAL_NATIVE_API_BASE_URL;
+}
+
 if (!allowLiveAgent && !allowLiveOpenAICompatible) {
   for (const key of [
     'OPENAI_API_KEY',
