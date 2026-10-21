@@ -26,6 +26,7 @@ import {
 import { runAgentJobWithMissionControl } from './mission_control_agent_job_runner.js';
 import { computeNextRunAt as computeAutomationNextRunAt } from './automation_job_service.js';
 import {
+  cleanupEmptyTurnArtifactDirectories,
   createPendingTurnArtifactDeliveryState,
   createTurnArtifactContext,
   ensureTurnArtifactDirectories,
@@ -11461,136 +11462,149 @@ export class BridgeCoordinator {
       intent: null,
     });
     const pendingArtifactDelivery = createPendingTurnArtifactDeliveryState(turnArtifactContext);
-    ensureTurnArtifactDirectories(turnArtifactContext);
-    const turnEvent = withTurnArtifactContext(event, turnArtifactContext);
-    this.activeTurns?.updateScopeTurn(scopeRef, {
-      bridgeSessionId: session.id,
-      providerProfileId: session.providerProfileId,
-      threadId: session.codexThreadId,
-      artifactDelivery: pendingArtifactDelivery,
-    });
-    debugCoordinator('turn_start_on_session', {
-      platform: scopeRef.platform,
-      scopeId: scopeRef.externalScopeId,
-      bridgeSessionId: session.id,
-      providerProfileId: session.providerProfileId,
-      threadId: session.codexThreadId,
-      cwd: session.cwd ?? null,
-      textPreview: truncateCoordinatorText(event?.text, 160),
-      attachmentCount: Array.isArray(event?.attachments) ? event.attachments.length : 0,
-      artifactContext: turnArtifactContext
-        ? {
-          bridgeSessionId: turnArtifactContext.bridgeSessionId ?? null,
-          turnId: turnArtifactContext.turnId ?? null,
-          artifactDir: turnArtifactContext.artifactDir ?? null,
-          spoolDir: turnArtifactContext.spoolDir ?? null,
-          intent: turnArtifactContext.intent,
-        }
-        : null,
-    });
-    let attemptedModelReset = false;
-    let attemptedWorkspaceReconnect = false;
-    let result;
-    while (true) {
-      try {
-        result = await providerPlugin.startTurn({
-          providerProfile,
-          bridgeSession: session,
-          sessionSettings,
-          event: turnEvent,
-          inputText: event.text,
-          onProgress: options.onProgress ?? null,
-          onTurnStarted: async (meta: { turnId?: string | null; threadId?: string | null } = {}) => {
-            debugCoordinator('turn_started', {
-              platform: scopeRef.platform,
-              scopeId: scopeRef.externalScopeId,
-              bridgeSessionId: session.id,
-              providerProfileId: session.providerProfileId,
-              threadId: meta.threadId ?? session.codexThreadId,
-              turnId: meta.turnId ?? null,
-            });
-            if (turnArtifactContext) {
-              turnArtifactContext.turnId = meta.turnId ?? null;
-            }
-            const active = this.activeTurns?.updateScopeTurn(scopeRef, {
-              bridgeSessionId: session.id,
-              providerProfileId: session.providerProfileId,
-              threadId: meta.threadId ?? session.codexThreadId,
-              turnId: meta.turnId ?? null,
-              artifactDelivery: pendingArtifactDelivery
-                ? {
-                  ...pendingArtifactDelivery,
-                  turnId: meta.turnId ?? null,
-                }
-                : null,
-            }) ?? null;
-            if (typeof options.onTurnStarted === 'function') {
-              await options.onTurnStarted({
-                turnId: meta.turnId ?? null,
-                threadId: meta.threadId ?? session.codexThreadId,
+    try {
+      ensureTurnArtifactDirectories(turnArtifactContext);
+      const turnEvent = withTurnArtifactContext(event, turnArtifactContext);
+      this.activeTurns?.updateScopeTurn(scopeRef, {
+        bridgeSessionId: session.id,
+        providerProfileId: session.providerProfileId,
+        threadId: session.codexThreadId,
+        artifactDelivery: pendingArtifactDelivery,
+      });
+      debugCoordinator('turn_start_on_session', {
+        platform: scopeRef.platform,
+        scopeId: scopeRef.externalScopeId,
+        bridgeSessionId: session.id,
+        providerProfileId: session.providerProfileId,
+        threadId: session.codexThreadId,
+        cwd: session.cwd ?? null,
+        textPreview: truncateCoordinatorText(event?.text, 160),
+        attachmentCount: Array.isArray(event?.attachments) ? event.attachments.length : 0,
+        artifactContext: turnArtifactContext
+          ? {
+            bridgeSessionId: turnArtifactContext.bridgeSessionId ?? null,
+            turnId: turnArtifactContext.turnId ?? null,
+            artifactDir: turnArtifactContext.artifactDir ?? null,
+            spoolDir: turnArtifactContext.spoolDir ?? null,
+            intent: turnArtifactContext.intent,
+          }
+          : null,
+      });
+      let attemptedModelReset = false;
+      let attemptedWorkspaceReconnect = false;
+      let result;
+      while (true) {
+        try {
+          result = await providerPlugin.startTurn({
+            providerProfile,
+            bridgeSession: session,
+            sessionSettings,
+            event: turnEvent,
+            inputText: event.text,
+            onProgress: options.onProgress ?? null,
+            onTurnStarted: async (meta: { turnId?: string | null; threadId?: string | null } = {}) => {
+              debugCoordinator('turn_started', {
+                platform: scopeRef.platform,
+                scopeId: scopeRef.externalScopeId,
                 bridgeSessionId: session.id,
                 providerProfileId: session.providerProfileId,
+                threadId: meta.threadId ?? session.codexThreadId,
+                turnId: meta.turnId ?? null,
               });
-            }
-            if (active?.interruptRequested && active.turnId && !active.interruptDispatched) {
-              await this.dispatchInterruptForActiveTurn(active);
-            }
-          },
-          onApprovalRequest: async (request: ProviderApprovalRequest) => {
-            this.activeTurns?.addPendingApproval(scopeRef, request);
-            if (typeof options.onApprovalRequest === 'function') {
-              await options.onApprovalRequest(request);
-            }
-          },
+              if (turnArtifactContext) {
+                turnArtifactContext.turnId = meta.turnId ?? null;
+              }
+              const active = this.activeTurns?.updateScopeTurn(scopeRef, {
+                bridgeSessionId: session.id,
+                providerProfileId: session.providerProfileId,
+                threadId: meta.threadId ?? session.codexThreadId,
+                turnId: meta.turnId ?? null,
+                artifactDelivery: pendingArtifactDelivery
+                  ? {
+                    ...pendingArtifactDelivery,
+                    turnId: meta.turnId ?? null,
+                  }
+                  : null,
+              }) ?? null;
+              if (typeof options.onTurnStarted === 'function') {
+                await options.onTurnStarted({
+                  turnId: meta.turnId ?? null,
+                  threadId: meta.threadId ?? session.codexThreadId,
+                  bridgeSessionId: session.id,
+                  providerProfileId: session.providerProfileId,
+                });
+              }
+              if (active?.interruptRequested && active.turnId && !active.interruptDispatched) {
+                await this.dispatchInterruptForActiveTurn(active);
+              }
+            },
+            onApprovalRequest: async (request: ProviderApprovalRequest) => {
+              this.activeTurns?.addPendingApproval(scopeRef, request);
+              if (typeof options.onApprovalRequest === 'function') {
+                await options.onApprovalRequest(request);
+              }
+            },
+          });
+        } catch (error) {
+          const failureMessage = formatUserError(error);
+          if (
+            !attemptedModelReset
+            && this.maybeResetUnsupportedCodexModel(session, sessionSettings, failureMessage)
+          ) {
+            attemptedModelReset = true;
+            sessionSettings = this.bridgeSessions.getSessionSettings(session.id);
+            continue;
+          }
+          if (
+            !attemptedWorkspaceReconnect
+            && await this.maybeReconnectInvalidCodexWorkspace(providerProfile, providerPlugin, failureMessage)
+          ) {
+            attemptedWorkspaceReconnect = true;
+            sessionSettings = this.bridgeSessions.getSessionSettings(session.id);
+            continue;
+          }
+          throw error;
+        }
+        const providerErrorMessage = typeof result?.errorMessage === 'string' ? result.errorMessage.trim() : '';
+        if (result?.outputState === 'provider_error' && providerErrorMessage) {
+          if (
+            !attemptedModelReset
+            && this.maybeResetUnsupportedCodexModel(session, sessionSettings, providerErrorMessage)
+          ) {
+            attemptedModelReset = true;
+            sessionSettings = this.bridgeSessions.getSessionSettings(session.id);
+            continue;
+          }
+          if (
+            !attemptedWorkspaceReconnect
+            && await this.maybeReconnectInvalidCodexWorkspace(providerProfile, providerPlugin, providerErrorMessage)
+          ) {
+            attemptedWorkspaceReconnect = true;
+            sessionSettings = this.bridgeSessions.getSessionSettings(session.id);
+            continue;
+          }
+        }
+        break;
+      }
+      const finalizedResult = finalizeTurnArtifacts({
+        result,
+        context: turnArtifactContext,
+      });
+      if (shouldRecoverFromProviderTurnResult(finalizedResult)) {
+        const errorMessage = finalizedResult.errorMessage || 'Codex turn failed with a recoverable provider error';
+        debugCoordinator('turn_result_recoverable_provider_error', {
+          platform: scopeRef.platform,
+          scopeId: scopeRef.externalScopeId,
+          bridgeSessionId: session.id,
+          threadId: finalizedResult?.threadId ?? session.codexThreadId,
+          turnId: finalizedResult?.turnId ?? null,
+          outputState: finalizedResult?.outputState ?? null,
+          finalSource: finalizedResult?.finalSource ?? null,
+          errorMessage,
         });
-      } catch (error) {
-        const failureMessage = formatUserError(error);
-        if (
-          !attemptedModelReset
-          && this.maybeResetUnsupportedCodexModel(session, sessionSettings, failureMessage)
-        ) {
-          attemptedModelReset = true;
-          sessionSettings = this.bridgeSessions.getSessionSettings(session.id);
-          continue;
-        }
-        if (
-          !attemptedWorkspaceReconnect
-          && await this.maybeReconnectInvalidCodexWorkspace(providerProfile, providerPlugin, failureMessage)
-        ) {
-          attemptedWorkspaceReconnect = true;
-          sessionSettings = this.bridgeSessions.getSessionSettings(session.id);
-          continue;
-        }
-        throw error;
+        throw new Error(errorMessage);
       }
-      const providerErrorMessage = typeof result?.errorMessage === 'string' ? result.errorMessage.trim() : '';
-      if (result?.outputState === 'provider_error' && providerErrorMessage) {
-        if (
-          !attemptedModelReset
-          && this.maybeResetUnsupportedCodexModel(session, sessionSettings, providerErrorMessage)
-        ) {
-          attemptedModelReset = true;
-          sessionSettings = this.bridgeSessions.getSessionSettings(session.id);
-          continue;
-        }
-        if (
-          !attemptedWorkspaceReconnect
-          && await this.maybeReconnectInvalidCodexWorkspace(providerProfile, providerPlugin, providerErrorMessage)
-        ) {
-          attemptedWorkspaceReconnect = true;
-          sessionSettings = this.bridgeSessions.getSessionSettings(session.id);
-          continue;
-        }
-      }
-      break;
-    }
-    const finalizedResult = finalizeTurnArtifacts({
-      result,
-      context: turnArtifactContext,
-    });
-    if (shouldRecoverFromProviderTurnResult(finalizedResult)) {
-      const errorMessage = finalizedResult.errorMessage || 'Codex turn failed with a recoverable provider error';
-      debugCoordinator('turn_result_recoverable_provider_error', {
+      debugCoordinator('turn_result_finalized', {
         platform: scopeRef.platform,
         scopeId: scopeRef.externalScopeId,
         bridgeSessionId: session.id,
@@ -11598,46 +11612,37 @@ export class BridgeCoordinator {
         turnId: finalizedResult?.turnId ?? null,
         outputState: finalizedResult?.outputState ?? null,
         finalSource: finalizedResult?.finalSource ?? null,
-        errorMessage,
+        errorMessage: finalizedResult?.errorMessage ?? null,
+        outputTextPreview: truncateCoordinatorText(finalizedResult?.outputText, 160),
+        previewTextPreview: truncateCoordinatorText(finalizedResult?.previewText, 160),
+        outputArtifactCount: Array.isArray(finalizedResult?.outputArtifacts) ? finalizedResult.outputArtifacts.length : 0,
+        artifactDelivery: finalizedResult?.artifactDelivery ?? null,
       });
-      throw new Error(errorMessage);
+      this.activeTurns?.updateScopeTurn(scopeRef, {
+        artifactDelivery: finalizedResult.artifactDelivery ?? pendingArtifactDelivery ?? null,
+      });
+      const nextSession = this.bridgeSessions.updateSession(session.id, {
+        codexThreadId: finalizedResult.threadId ?? session.codexThreadId,
+        title: this.bridgeSessions.resolveThreadDisplayTitle({
+          providerProfileId: session.providerProfileId,
+          threadId: finalizedResult.threadId ?? session.codexThreadId,
+          providerTitle: finalizedResult.title ?? null,
+          fallbackTitle: session.title,
+        }),
+        cwd: normalizeCwd(session.cwd) ?? this.resolveEventCwd(event),
+      });
+      this.bridgeSessions.upsertSessionSettings(session.id, {
+        metadata: {
+          lastArtifactDelivery: finalizedResult.artifactDelivery ?? null,
+        },
+      });
+      if (this.resolveStopCheckpoint(session.id)) {
+        this.clearStopCheckpoint(session.id);
+      }
+      return { result: finalizedResult, session: nextSession };
+    } finally {
+      cleanupEmptyTurnArtifactDirectories(turnArtifactContext);
     }
-    debugCoordinator('turn_result_finalized', {
-      platform: scopeRef.platform,
-      scopeId: scopeRef.externalScopeId,
-      bridgeSessionId: session.id,
-      threadId: finalizedResult?.threadId ?? session.codexThreadId,
-      turnId: finalizedResult?.turnId ?? null,
-      outputState: finalizedResult?.outputState ?? null,
-      finalSource: finalizedResult?.finalSource ?? null,
-      errorMessage: finalizedResult?.errorMessage ?? null,
-      outputTextPreview: truncateCoordinatorText(finalizedResult?.outputText, 160),
-      previewTextPreview: truncateCoordinatorText(finalizedResult?.previewText, 160),
-      outputArtifactCount: Array.isArray(finalizedResult?.outputArtifacts) ? finalizedResult.outputArtifacts.length : 0,
-      artifactDelivery: finalizedResult?.artifactDelivery ?? null,
-    });
-    this.activeTurns?.updateScopeTurn(scopeRef, {
-      artifactDelivery: finalizedResult.artifactDelivery ?? pendingArtifactDelivery ?? null,
-    });
-    const nextSession = this.bridgeSessions.updateSession(session.id, {
-      codexThreadId: finalizedResult.threadId ?? session.codexThreadId,
-      title: this.bridgeSessions.resolveThreadDisplayTitle({
-        providerProfileId: session.providerProfileId,
-        threadId: finalizedResult.threadId ?? session.codexThreadId,
-        providerTitle: finalizedResult.title ?? null,
-        fallbackTitle: session.title,
-      }),
-      cwd: normalizeCwd(session.cwd) ?? this.resolveEventCwd(event),
-    });
-    this.bridgeSessions.upsertSessionSettings(session.id, {
-      metadata: {
-        lastArtifactDelivery: finalizedResult.artifactDelivery ?? null,
-      },
-    });
-    if (this.resolveStopCheckpoint(session.id)) {
-      this.clearStopCheckpoint(session.id);
-    }
-    return { result: finalizedResult, session: nextSession };
   }
 
   maybeResetUnsupportedCodexModel(session, sessionSettings, failureMessage: string): boolean {
