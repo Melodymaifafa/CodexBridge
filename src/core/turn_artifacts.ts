@@ -10,6 +10,7 @@ import type {
   TurnArtifactRejectedItem,
 } from '../types/core.js';
 import type { OutputArtifact, OutputArtifactKind, ProviderTurnResult } from '../types/provider.js';
+import { writeSequencedDebugLog } from './sequenced_stderr.js';
 
 const MANIFEST_FENCE = 'codexbridge-artifacts';
 const FALLBACK_SCAN_LIMIT = 32;
@@ -76,6 +77,23 @@ export function ensureTurnArtifactDirectories(context: TurnArtifactContext | nul
   }
   fs.mkdirSync(context.artifactDir, { recursive: true });
   fs.mkdirSync(context.spoolDir, { recursive: true });
+}
+
+// Non-recursive on purpose: a folder that holds a written or delivered file stays.
+export function cleanupEmptyTurnArtifactDirectories(context: TurnArtifactContext | null | undefined): void {
+  if (!context) {
+    return;
+  }
+  for (const dir of [context.artifactDir, context.spoolDir]) {
+    try {
+      fs.rmdirSync(dir);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code !== 'ENOENT' && code !== 'ENOTEMPTY' && code !== 'EEXIST') {
+        writeSequencedDebugLog('turn-artifacts', 'cleanup_empty_dir_failed', { dir, code: code ?? null });
+      }
+    }
+  }
 }
 
 export function createPendingTurnArtifactDeliveryState(
