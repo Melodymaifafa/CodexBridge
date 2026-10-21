@@ -39,6 +39,11 @@ function shouldWrite(envVar: string | null | undefined): boolean {
   return !envVar || process.env[envVar] === '1';
 }
 
+// `--redirect-warnings=<file>` (in argv or NODE_OPTIONS) tells Node to write warnings to that file.
+function warningsRedirectedToFile(execArgv: readonly string[], nodeOptions = ''): boolean {
+  return /(?:^|\s)--redirect[-_]warnings(?:=|\s+)\S/u.test(`${execArgv.join(' ')} ${nodeOptions}`);
+}
+
 export function classifyNetworkError(error: unknown): NetworkErrorKind | null {
   const code = typeof error === 'object' && error && 'code' in error
     ? String((error as { code?: unknown }).code ?? '')
@@ -123,9 +128,13 @@ export function createSequencedStderrWriter({
   };
 
   // Replaces Node's default warning printer so warnings get the same timestamp.
-  const captureProcessWarnings = (target: NodeJS.EventEmitter = process) => {
+  // Warnings redirected to a file stay with Node's printer, which writes them there.
+  const captureProcessWarnings = (
+    target: NodeJS.EventEmitter = process,
+    { execArgv = process.execArgv, nodeOptions = process.env.NODE_OPTIONS } = {},
+  ) => {
     const defaultListeners = target.listeners('warning');
-    if (defaultListeners.length === 0) {
+    if (defaultListeners.length === 0 || warningsRedirectedToFile(execArgv, nodeOptions)) {
       return;
     }
     for (const listener of defaultListeners) {

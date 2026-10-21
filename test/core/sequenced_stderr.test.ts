@@ -220,7 +220,7 @@ test('captured process warnings replace the default output with timestamped line
     code: 'DEP0205',
   });
 
-  writer.captureProcessWarnings(target);
+  writer.captureProcessWarnings(target, { execArgv: [], nodeOptions: '' });
   target.emit('warning', warning);
   target.emit('warning', deprecation);
 
@@ -230,4 +230,40 @@ test('captured process warnings replace the default output with timestamped line
     `${START} [2]     at _addListener (node:events:1:1)`,
     `${START} [3] (node:${process.pid}) [DEP0205] DeprecationWarning: \`module.register()\` is deprecated.`,
   ]);
+});
+
+test('process warnings stay with Node when --redirect-warnings sends them to a file', () => {
+  const redirects = [
+    { execArgv: ['--redirect-warnings=/var/log/bridge-warnings.log'], nodeOptions: '' },
+    { execArgv: ['--redirect-warnings', 'warnings.log'], nodeOptions: '' },
+    { execArgv: [], nodeOptions: '--max-old-space-size=512 --redirect-warnings="bridge warnings.log"' },
+    { execArgv: [], nodeOptions: '--redirect_warnings=warnings.log' },
+  ];
+
+  for (const options of redirects) {
+    const { writer, lines } = createTestWriter();
+    const target = new EventEmitter();
+    let defaultOutputCalls = 0;
+    target.on('warning', () => {
+      defaultOutputCalls += 1;
+    });
+
+    writer.captureProcessWarnings(target, options);
+    target.emit('warning', Object.assign(new Error('leak'), { name: 'MaxListenersExceededWarning' }));
+
+    assert.equal(defaultOutputCalls, 1, JSON.stringify(options));
+    assert.deepEqual(lines, []);
+  }
+
+  // An empty value is no redirect: Node then prints to stderr, so the warning is captured.
+  const { writer, lines } = createTestWriter();
+  const target = new EventEmitter();
+  let defaultOutputCalls = 0;
+  target.on('warning', () => {
+    defaultOutputCalls += 1;
+  });
+  writer.captureProcessWarnings(target, { execArgv: ['--redirect-warnings='], nodeOptions: '' });
+  target.emit('warning', Object.assign(new Error('leak'), { name: 'MaxListenersExceededWarning' }));
+  assert.equal(defaultOutputCalls, 0);
+  assert.equal(lines[0], `${START} [1] (node:${process.pid}) MaxListenersExceededWarning: leak`);
 });
