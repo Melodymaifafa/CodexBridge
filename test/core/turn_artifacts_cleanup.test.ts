@@ -183,6 +183,27 @@ test('cleanupEmptyTurnArtifactDirectories keeps a symlink and leaves its target 
   }
 });
 
+test('cleanupEmptyTurnArtifactDirectories does not follow a turn folder replaced by a symlink', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifact-cleanup-'));
+  const context = createTurnArtifactContext({ bridgeSessionId: 'session-1', cwd: tempDir, intent: null });
+  ensureTurnArtifactDirectories(context);
+  const outsideDir = path.join(tempDir, 'outside');
+  const outsideEmptyDir = path.join(outsideDir, 'empty');
+  fs.mkdirSync(outsideEmptyDir, { recursive: true });
+  fs.rmdirSync(context.artifactDir);
+  fs.symlinkSync(outsideDir, context.artifactDir, 'junction');
+
+  try {
+    cleanupEmptyTurnArtifactDirectories(context);
+
+    assert.equal(fs.lstatSync(context.artifactDir).isSymbolicLink(), true);
+    assert.equal(fs.existsSync(outsideEmptyDir), true);
+    assert.equal(fs.existsSync(context.spoolDir), false);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('cleanupEmptyTurnArtifactDirectories ignores missing folders and a missing context', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifact-cleanup-'));
   const context = createTurnArtifactContext({ bridgeSessionId: 'session-1', cwd: tempDir, intent: null });

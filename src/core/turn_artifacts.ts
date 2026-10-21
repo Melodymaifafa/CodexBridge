@@ -91,13 +91,16 @@ export function cleanupEmptyTurnArtifactDirectories(context: TurnArtifactContext
 function removeEmptyDirectoryTree(dir: string): boolean {
   let entries: fs.Dirent[];
   try {
+    // lstat before readdir: a folder swapped for a symlink or junction counts as content and is never followed.
+    if (!fs.lstatSync(dir).isDirectory()) {
+      return false;
+    }
     entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch (error) {
     return handleEmptyDirectoryCleanupError(dir, error);
   }
   let empty = true;
   for (const entry of entries) {
-    // Dirent types come from lstat, so a symlink counts as content and is never followed.
     if (!entry.isDirectory() || !removeEmptyDirectoryTree(path.join(dir, entry.name))) {
       empty = false;
     }
