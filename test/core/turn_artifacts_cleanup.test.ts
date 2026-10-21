@@ -126,6 +126,63 @@ test('cleanupEmptyTurnArtifactDirectories removes only the empty folder when the
   }
 });
 
+test('cleanupEmptyTurnArtifactDirectories removes empty subfolders bottom-up', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifact-cleanup-'));
+  const context = createTurnArtifactContext({ bridgeSessionId: 'session-1', cwd: tempDir, intent: null });
+  ensureTurnArtifactDirectories(context);
+  fs.mkdirSync(path.join(context.artifactDir, 'output', 'deep'), { recursive: true });
+  fs.mkdirSync(path.join(context.spoolDir, 'parts'), { recursive: true });
+
+  try {
+    cleanupEmptyTurnArtifactDirectories(context);
+
+    assert.equal(fs.existsSync(context.artifactDir), false);
+    assert.equal(fs.existsSync(context.spoolDir), false);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('cleanupEmptyTurnArtifactDirectories keeps every folder on the path to a file', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifact-cleanup-'));
+  const context = createTurnArtifactContext({ bridgeSessionId: 'session-1', cwd: tempDir, intent: null });
+  ensureTurnArtifactDirectories(context);
+  const reportFile = path.join(context.artifactDir, 'output', 'report.pdf');
+  fs.mkdirSync(path.join(context.artifactDir, 'output', 'tmp'), { recursive: true });
+  fs.mkdirSync(path.join(context.artifactDir, 'scratch'));
+  fs.writeFileSync(reportFile, 'pdf');
+
+  try {
+    cleanupEmptyTurnArtifactDirectories(context);
+
+    assert.equal(fs.readFileSync(reportFile, 'utf8'), 'pdf');
+    assert.equal(fs.existsSync(path.join(context.artifactDir, 'output', 'tmp')), false);
+    assert.equal(fs.existsSync(path.join(context.artifactDir, 'scratch')), false);
+    assert.equal(fs.existsSync(context.spoolDir), false);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('cleanupEmptyTurnArtifactDirectories keeps a symlink and leaves its target alone', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifact-cleanup-'));
+  const context = createTurnArtifactContext({ bridgeSessionId: 'session-1', cwd: tempDir, intent: null });
+  ensureTurnArtifactDirectories(context);
+  const outsideDir = path.join(tempDir, 'outside', 'empty');
+  const symlinkPath = path.join(context.artifactDir, 'link');
+  fs.mkdirSync(outsideDir, { recursive: true });
+  fs.symlinkSync(outsideDir, symlinkPath, 'junction');
+
+  try {
+    cleanupEmptyTurnArtifactDirectories(context);
+
+    assert.equal(fs.lstatSync(symlinkPath).isSymbolicLink(), true);
+    assert.equal(fs.existsSync(outsideDir), true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('cleanupEmptyTurnArtifactDirectories ignores missing folders and a missing context', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifact-cleanup-'));
   const context = createTurnArtifactContext({ bridgeSessionId: 'session-1', cwd: tempDir, intent: null });
@@ -172,6 +229,32 @@ test('bridge coordinator removes the empty turn folders when the turn throws', a
     await runtime.services.bridgeCoordinator.handleInboundEvent({
       platform: 'weixin',
       externalScopeId: 'wx-cleanup-error',
+      text: 'hello',
+    }).catch(() => null);
+
+    assert.ok(provider.turnContexts.length >= 1);
+    for (const context of provider.turnContexts) {
+      assert.ok(context.artifactDir.startsWith(tempDir));
+      assert.equal(fs.existsSync(context.artifactDir), false);
+      assert.equal(fs.existsSync(context.spoolDir), false);
+    }
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('bridge coordinator removes empty subfolders a failed turn left behind', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifact-cleanup-'));
+  const { runtime, provider } = makeRuntime(tempDir);
+  provider.onTurn = (context) => {
+    fs.mkdirSync(path.join(context.artifactDir, 'output'), { recursive: true });
+    throw new Error('provider exploded');
+  };
+
+  try {
+    await runtime.services.bridgeCoordinator.handleInboundEvent({
+      platform: 'weixin',
+      externalScopeId: 'wx-cleanup-nested',
       text: 'hello',
     }).catch(() => null);
 

@@ -79,21 +79,49 @@ export function ensureTurnArtifactDirectories(context: TurnArtifactContext | nul
   fs.mkdirSync(context.spoolDir, { recursive: true });
 }
 
-// Non-recursive on purpose: a folder that holds a written or delivered file stays.
+// Only non-recursive rmdir, bottom-up: empty subfolders go, any folder on the path to a file stays.
 export function cleanupEmptyTurnArtifactDirectories(context: TurnArtifactContext | null | undefined): void {
   if (!context) {
     return;
   }
-  for (const dir of [context.artifactDir, context.spoolDir]) {
-    try {
-      fs.rmdirSync(dir);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException)?.code;
-      if (code !== 'ENOENT' && code !== 'ENOTEMPTY' && code !== 'EEXIST') {
-        writeSequencedDebugLog('turn-artifacts', 'cleanup_empty_dir_failed', { dir, code: code ?? null });
-      }
+  removeEmptyDirectoryTree(context.artifactDir);
+  removeEmptyDirectoryTree(context.spoolDir);
+}
+
+function removeEmptyDirectoryTree(dir: string): boolean {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (error) {
+    return handleEmptyDirectoryCleanupError(dir, error);
+  }
+  let empty = true;
+  for (const entry of entries) {
+    // Dirent types come from lstat, so a symlink counts as content and is never followed.
+    if (!entry.isDirectory() || !removeEmptyDirectoryTree(path.join(dir, entry.name))) {
+      empty = false;
     }
   }
+  if (!empty) {
+    return false;
+  }
+  try {
+    fs.rmdirSync(dir);
+    return true;
+  } catch (error) {
+    return handleEmptyDirectoryCleanupError(dir, error);
+  }
+}
+
+function handleEmptyDirectoryCleanupError(dir: string, error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  if (code === 'ENOENT') {
+    return true;
+  }
+  if (code !== 'ENOTEMPTY' && code !== 'EEXIST') {
+    writeSequencedDebugLog('turn-artifacts', 'cleanup_empty_dir_failed', { dir, code: code ?? null });
+  }
+  return false;
 }
 
 export function createPendingTurnArtifactDeliveryState(
