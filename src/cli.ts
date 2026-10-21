@@ -23,6 +23,7 @@ import { createI18n } from './i18n/index.js';
 import {
   captureProcessWarningsInSequencedStderr,
   flushSequencedStderr,
+  flushSequencedStderrOnExit,
   writeSequencedStderrError,
 } from './core/sequenced_stderr.js';
 
@@ -419,6 +420,7 @@ async function runWeixinSend(
 
 async function runWeixinServe(args: string[]) {
   captureProcessWarningsInSequencedStderr();
+  flushSequencedStderrOnExit();
   const i18n = createI18n();
   const options = parseWeixinServeArgs(args);
   const stateDir = path.resolve(options.stateDir ?? defaultCodexBridgeStateDir());
@@ -502,6 +504,7 @@ async function runWeixinServe(args: string[]) {
       return;
     }
     stopped = true;
+    // Errors raised by the shutdown awaits below are written by the exit flush.
     flushSequencedStderr();
     process.stdout.write(`${i18n.t('cli.serve.stopping', { signal })}\n`);
     try {

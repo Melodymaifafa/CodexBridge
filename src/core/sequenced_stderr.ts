@@ -142,7 +142,13 @@ export function createSequencedStderrWriter({
     });
   };
 
-  return { writeLine, writeError, flush, captureProcessWarnings };
+  // The flush timer is unref'd, so a run that starts during shutdown (an
+  // in-flight request failing while the bridge stops) is written on exit.
+  const flushOnExit = (target: NodeJS.EventEmitter = process) => {
+    target.once('exit', flush);
+  };
+
+  return { writeLine, writeError, flush, captureProcessWarnings, flushOnExit };
 }
 
 const stderrWriter = createSequencedStderrWriter();
@@ -169,6 +175,10 @@ export function flushSequencedStderr(): void {
 
 export function captureProcessWarningsInSequencedStderr(): void {
   stderrWriter.captureProcessWarnings();
+}
+
+export function flushSequencedStderrOnExit(): void {
+  stderrWriter.flushOnExit();
 }
 
 export function writeSequencedDebugLog(

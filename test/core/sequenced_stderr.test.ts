@@ -166,6 +166,26 @@ test('a pending network error line is written 60 seconds after its last repeat e
   ]);
 });
 
+test('a network error line still pending when the process exits is written on exit', () => {
+  const { writer, lines, advance } = createTestWriter();
+  const target = new EventEmitter();
+
+  writer.flushOnExit(target);
+  writer.writeError('[weixin]', dnsError());
+  // Shutdown flushes first; an in-flight request then fails while the bridge stops.
+  writer.flush();
+  advance(1_000);
+  writer.writeError('[weixin]', networkError('read ECONNRESET', 'ECONNRESET'));
+  assert.equal(lines.length, 1);
+
+  target.emit('exit', 0);
+
+  assert.deepEqual(lines, [
+    `${START} [1] [weixin] network ENOTFOUND: Error: getaddrinfo ENOTFOUND ilinkai.weixin.qq.com`,
+    '2026-10-16T02:00:01.000Z [2] [weixin] network ECONNRESET: Error: read ECONNRESET',
+  ]);
+});
+
 test('non-network errors keep their stack trace and end a pending network error line', () => {
   const { writer, lines, advance } = createTestWriter();
   const error = new Error('Codex turn failed');
