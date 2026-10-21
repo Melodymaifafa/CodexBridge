@@ -117,33 +117,52 @@ test('a different network error type starts a new line', () => {
   ]);
 });
 
-test('the same network error starts a new line once the 60 second window has passed', () => {
+test('the same network error keeps merging while each repeat comes within 60 seconds of the last one', () => {
+  const { writer, lines, advance } = createTestWriter();
+
+  writer.writeError('[weixin]', dnsError());
+  advance(50_000);
+  writer.writeError('[weixin]', dnsError());
+  advance(50_000);
+  writer.writeError('[weixin]', dnsError());
+  writer.flush();
+
+  assert.deepEqual(lines, [
+    `${START} [1] [weixin] network ENOTFOUND: Error: getaddrinfo ENOTFOUND ilinkai.weixin.qq.com (x3 until 2026-10-16T02:01:40.000Z)`,
+  ]);
+});
+
+test('the same network error starts a new line after 60 seconds without a repeat', () => {
   const { writer, lines, advance } = createTestWriter();
 
   writer.writeError('[weixin]', dnsError());
   advance(59_999);
   writer.writeError('[weixin]', dnsError());
-  advance(1);
+  advance(60_000);
   writer.writeError('[weixin]', dnsError());
   writer.flush();
 
   assert.deepEqual(lines, [
     `${START} [1] [weixin] network ENOTFOUND: Error: getaddrinfo ENOTFOUND ilinkai.weixin.qq.com (x2 until 2026-10-16T02:00:59.999Z)`,
-    '2026-10-16T02:01:00.000Z [2] [weixin] network ENOTFOUND: Error: getaddrinfo ENOTFOUND ilinkai.weixin.qq.com',
+    '2026-10-16T02:01:59.999Z [2] [weixin] network ENOTFOUND: Error: getaddrinfo ENOTFOUND ilinkai.weixin.qq.com',
   ]);
 });
 
-test('a pending network error line is written when the window ends even if nothing else is logged', (t) => {
+test('a pending network error line is written 60 seconds after its last repeat even if nothing else is logged', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  const { writer, lines } = createTestWriter();
+  const { writer, lines, advance } = createTestWriter();
 
   writer.writeError('[weixin]', dnsError());
+  advance(50_000);
+  t.mock.timers.tick(50_000);
+  writer.writeError('[weixin]', dnsError());
+  t.mock.timers.tick(59_999);
   assert.deepEqual(lines, []);
 
-  t.mock.timers.tick(60_000);
+  t.mock.timers.tick(1);
 
   assert.deepEqual(lines, [
-    `${START} [1] [weixin] network ENOTFOUND: Error: getaddrinfo ENOTFOUND ilinkai.weixin.qq.com`,
+    `${START} [1] [weixin] network ENOTFOUND: Error: getaddrinfo ENOTFOUND ilinkai.weixin.qq.com (x2 until 2026-10-16T02:00:50.000Z)`,
   ]);
 });
 

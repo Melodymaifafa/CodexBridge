@@ -68,7 +68,7 @@ export function createSequencedStderrWriter({
   };
 
   // A merged run is written once, when it ends: on any other line, a different
-  // network error, the end of its window, or an explicit flush.
+  // network error, 60s without a repeat, or an explicit flush.
   const flush = () => {
     if (!pendingRun) {
       return;
@@ -78,6 +78,12 @@ export function createSequencedStderrWriter({
     clearTimeout(run.timer);
     const count = run.count > 1 ? ` (x${run.count} until ${run.lastAt.toISOString()})` : '';
     writeLines([`${run.line}${count}`], run.firstAt);
+  };
+
+  const scheduleFlush = () => {
+    const timer = setTimeout(flush, mergeWindowMs);
+    timer.unref?.();
+    return timer;
   };
 
   const writeLine = (message: string) => {
@@ -104,16 +110,16 @@ export function createSequencedStderrWriter({
       return;
     }
     const key = `${prefix}\u0000${kind}`;
-    if (pendingRun?.key === key && at.getTime() - pendingRun.firstAt.getTime() < mergeWindowMs) {
+    if (pendingRun?.key === key && at.getTime() - pendingRun.lastAt.getTime() < mergeWindowMs) {
       pendingRun.count += 1;
       pendingRun.lastAt = at;
+      clearTimeout(pendingRun.timer);
+      pendingRun.timer = scheduleFlush();
       return;
     }
     flush();
     const summary = String(error).split(/\r?\n/u)[0];
-    const timer = setTimeout(flush, mergeWindowMs);
-    timer.unref?.();
-    pendingRun = { key, line: `${prefix} network ${kind}: ${summary}`, firstAt: at, lastAt: at, count: 1, timer };
+    pendingRun = { key, line: `${prefix} network ${kind}: ${summary}`, firstAt: at, lastAt: at, count: 1, timer: scheduleFlush() };
   };
 
   // Replaces Node's default warning printer so warnings get the same timestamp.
