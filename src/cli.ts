@@ -26,6 +26,7 @@ import {
   flushSequencedStderrOnExit,
   writeSequencedStderrError,
 } from './core/sequenced_stderr.js';
+import { sweepStaleEmptyTurnArtifactDirectories } from './core/turn_artifacts.js';
 
 const CLI_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(CLI_FILE), '..');
@@ -494,6 +495,15 @@ async function runWeixinServe(args: string[]) {
   process.stdout.write(`serve_lock: ${serveLock.lockPath}\n`);
   process.stdout.write(`${i18n.t('cli.serve.defaultCwd', { value: runtime.config.defaultCwd ?? i18n.t('common.none') })}\n`);
   process.stdout.write(`native_api_enabled: ${nativeApi ? 'true' : 'false'}\n`);
+  const staleEmptyArtifactDirsRemoved = sweepStaleEmptyTurnArtifactDirectories({
+    cwds: [
+      defaultCwd,
+      ...repositories.bridgeSessions.list().map((session) => session.cwd),
+      ...repositories.automationJobs.list().map((job) => job.cwd),
+      ...repositories.agentJobs.list().map((job) => job.cwd),
+    ],
+  });
+  process.stdout.write(`stale_empty_artifact_dirs_removed: ${staleEmptyArtifactDirsRemoved}\n`);
 
   let stopped = false;
   process.once('exit', () => {
