@@ -243,7 +243,7 @@ test('sweepStaleEmptyTurnArtifactDirectories removes empty folders older than an
   const oldSpoolDir = makeSweepFolder(tempDir, 'artifact-spool', 'old-turn', 2 * HOUR_MS);
 
   try {
-    assert.equal(sweepStaleEmptyTurnArtifactDirectories({ baseDir: tempDir }), 2);
+    assert.equal(sweepStaleEmptyTurnArtifactDirectories({ homeDir: tempDir }), 2);
 
     assert.equal(fs.existsSync(oldArtifactDir), false);
     assert.equal(fs.existsSync(oldSpoolDir), false);
@@ -260,7 +260,7 @@ test('sweepStaleEmptyTurnArtifactDirectories keeps an old folder that holds a fi
   const spoolDir = makeSweepFolder(tempDir, 'artifact-spool', 'old-turn', 2 * HOUR_MS, { 'report.pdf': 'pdf' });
 
   try {
-    assert.equal(sweepStaleEmptyTurnArtifactDirectories({ baseDir: tempDir }), 0);
+    assert.equal(sweepStaleEmptyTurnArtifactDirectories({ homeDir: tempDir }), 0);
 
     assert.equal(fs.readFileSync(path.join(artifactDir, 'report.pdf'), 'utf8'), 'pdf');
     assert.equal(fs.readFileSync(path.join(spoolDir, 'report.pdf'), 'utf8'), 'pdf');
@@ -275,10 +275,34 @@ test('sweepStaleEmptyTurnArtifactDirectories keeps a fresh empty folder of a run
   const freshSpoolDir = makeSweepFolder(tempDir, 'artifact-spool', 'running-turn', 5 * 60 * 1000);
 
   try {
-    assert.equal(sweepStaleEmptyTurnArtifactDirectories({ baseDir: tempDir }), 0);
+    assert.equal(sweepStaleEmptyTurnArtifactDirectories({ homeDir: tempDir }), 0);
 
     assert.equal(fs.existsSync(freshArtifactDir), true);
     assert.equal(fs.existsSync(freshSpoolDir), true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('sweepStaleEmptyTurnArtifactDirectories sweeps working-directory roots as well as home', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifact-sweep-'));
+  const homeDir = path.join(tempDir, 'home');
+  const workspaceDir = path.join(tempDir, 'workspace');
+  const homeArtifactDir = makeSweepFolder(homeDir, 'turn-artifacts', 'old-turn', 2 * HOUR_MS);
+  const workspaceArtifactDir = makeSweepFolder(workspaceDir, 'turn-artifacts', 'old-turn', 2 * HOUR_MS);
+  const workspaceSpoolDir = makeSweepFolder(workspaceDir, 'artifact-spool', 'old-turn', 2 * HOUR_MS);
+  const workspaceFileDir = makeSweepFolder(workspaceDir, 'turn-artifacts', 'kept-turn', 2 * HOUR_MS, { 'report.pdf': 'pdf' });
+
+  try {
+    assert.equal(sweepStaleEmptyTurnArtifactDirectories({
+      homeDir,
+      cwds: [workspaceDir, `${workspaceDir}/`, homeDir, null, '  '],
+    }), 3);
+
+    assert.equal(fs.existsSync(homeArtifactDir), false);
+    assert.equal(fs.existsSync(workspaceArtifactDir), false);
+    assert.equal(fs.existsSync(workspaceSpoolDir), false);
+    assert.equal(fs.readFileSync(path.join(workspaceFileDir, 'report.pdf'), 'utf8'), 'pdf');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -288,7 +312,7 @@ test('sweepStaleEmptyTurnArtifactDirectories ignores missing roots', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifact-sweep-'));
 
   try {
-    assert.equal(sweepStaleEmptyTurnArtifactDirectories({ baseDir: tempDir }), 0);
+    assert.equal(sweepStaleEmptyTurnArtifactDirectories({ homeDir: tempDir }), 0);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

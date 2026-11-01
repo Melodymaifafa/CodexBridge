@@ -130,16 +130,33 @@ function handleEmptyDirectoryCleanupError(dir: string, error: unknown): boolean 
 }
 
 // Startup sweep for folders that per-turn cleanup never saw (older turns, crashes).
+// Turns store folders under their writable cwd, else home, so visit home plus every known cwd.
 // Direct subfolders only, rmdir only; the age limit keeps a running turn's fresh folder.
 export function sweepStaleEmptyTurnArtifactDirectories({
-  baseDir = os.homedir(),
+  cwds = [],
+  homeDir = os.homedir(),
   minAgeMs = STALE_EMPTY_TURN_ARTIFACT_DIR_AGE_MS,
   now = Date.now(),
 }: {
-  baseDir?: string;
+  cwds?: Array<string | null | undefined>;
+  homeDir?: string;
   minAgeMs?: number;
   now?: number;
 } = {}): number {
+  const baseDirs = new Set(
+    [homeDir, ...cwds]
+      .map((dir) => String(dir ?? '').trim())
+      .filter(Boolean)
+      .map((dir) => path.resolve(dir)),
+  );
+  let removedCount = 0;
+  for (const baseDir of baseDirs) {
+    removedCount += sweepStaleEmptyTurnArtifactRoots(baseDir, minAgeMs, now);
+  }
+  return removedCount;
+}
+
+function sweepStaleEmptyTurnArtifactRoots(baseDir: string, minAgeMs: number, now: number): number {
   let removedCount = 0;
   for (const rootName of TURN_ARTIFACT_ROOT_NAMES) {
     const rootDir = path.join(baseDir, '.codexbridge', rootName);
