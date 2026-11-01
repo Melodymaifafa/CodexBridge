@@ -7,6 +7,7 @@ import {
   cleanupEmptyTurnArtifactDirectories,
   createTurnArtifactContext,
   ensureTurnArtifactDirectories,
+  sweepStaleEmptyTurnArtifactDirectories,
 } from '../../src/core/turn_artifacts.js';
 import { createCodexBridgeRuntime } from '../../src/runtime/bootstrap.js';
 import type { TurnArtifactContext } from '../../src/types/core.js';
@@ -212,6 +213,82 @@ test('cleanupEmptyTurnArtifactDirectories ignores missing folders and a missing 
     assert.doesNotThrow(() => cleanupEmptyTurnArtifactDirectories(context));
     assert.doesNotThrow(() => cleanupEmptyTurnArtifactDirectories(null));
     assert.doesNotThrow(() => cleanupEmptyTurnArtifactDirectories(undefined));
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+const HOUR_MS = 60 * 60 * 1000;
+
+function makeSweepFolder(
+  baseDir: string,
+  rootName: string,
+  name: string,
+  ageMs: number,
+  files: Record<string, string> = {},
+): string {
+  const dir = path.join(baseDir, '.codexbridge', rootName, name);
+  fs.mkdirSync(dir, { recursive: true });
+  for (const [fileName, content] of Object.entries(files)) {
+    fs.writeFileSync(path.join(dir, fileName), content);
+  }
+  const time = new Date(Date.now() - ageMs);
+  fs.utimesSync(dir, time, time);
+  return dir;
+}
+
+test('sweepStaleEmptyTurnArtifactDirectories removes empty folders older than an hour', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifact-sweep-'));
+  const oldArtifactDir = makeSweepFolder(tempDir, 'turn-artifacts', 'old-turn', 2 * HOUR_MS);
+  const oldSpoolDir = makeSweepFolder(tempDir, 'artifact-spool', 'old-turn', 2 * HOUR_MS);
+
+  try {
+    assert.equal(sweepStaleEmptyTurnArtifactDirectories({ baseDir: tempDir }), 2);
+
+    assert.equal(fs.existsSync(oldArtifactDir), false);
+    assert.equal(fs.existsSync(oldSpoolDir), false);
+    assert.equal(fs.existsSync(path.dirname(oldArtifactDir)), true);
+    assert.equal(fs.existsSync(path.dirname(oldSpoolDir)), true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('sweepStaleEmptyTurnArtifactDirectories keeps an old folder that holds a file', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifact-sweep-'));
+  const artifactDir = makeSweepFolder(tempDir, 'turn-artifacts', 'old-turn', 2 * HOUR_MS, { 'report.pdf': 'pdf' });
+  const spoolDir = makeSweepFolder(tempDir, 'artifact-spool', 'old-turn', 2 * HOUR_MS, { 'report.pdf': 'pdf' });
+
+  try {
+    assert.equal(sweepStaleEmptyTurnArtifactDirectories({ baseDir: tempDir }), 0);
+
+    assert.equal(fs.readFileSync(path.join(artifactDir, 'report.pdf'), 'utf8'), 'pdf');
+    assert.equal(fs.readFileSync(path.join(spoolDir, 'report.pdf'), 'utf8'), 'pdf');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('sweepStaleEmptyTurnArtifactDirectories keeps a fresh empty folder of a running turn', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifact-sweep-'));
+  const freshArtifactDir = makeSweepFolder(tempDir, 'turn-artifacts', 'running-turn', 5 * 60 * 1000);
+  const freshSpoolDir = makeSweepFolder(tempDir, 'artifact-spool', 'running-turn', 5 * 60 * 1000);
+
+  try {
+    assert.equal(sweepStaleEmptyTurnArtifactDirectories({ baseDir: tempDir }), 0);
+
+    assert.equal(fs.existsSync(freshArtifactDir), true);
+    assert.equal(fs.existsSync(freshSpoolDir), true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('sweepStaleEmptyTurnArtifactDirectories ignores missing roots', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifact-sweep-'));
+
+  try {
+    assert.equal(sweepStaleEmptyTurnArtifactDirectories({ baseDir: tempDir }), 0);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
