@@ -10,12 +10,15 @@ import type {
   TurnArtifactRejectedItem,
 } from '../types/core.js';
 import type { OutputArtifact, OutputArtifactKind, ProviderTurnResult } from '../types/provider.js';
+import { writeSequencedDebugLog } from './sequenced_stderr.js';
 
 const MANIFEST_FENCE = 'codexbridge-artifacts';
 const FALLBACK_SCAN_LIMIT = 32;
 const DEFAULT_DELIVERABLE_BASENAME = 'deliverable';
 const DEFAULT_MAX_ARTIFACT_COUNT = 3;
 const DEFAULT_MAX_ARTIFACT_SIZE_BYTES = 25 * 1024 * 1024;
+const TURN_ARTIFACT_ROOT_NAMES = ['turn-artifacts', 'artifact-spool'];
+const STALE_EMPTY_TURN_ARTIFACT_DIR_AGE_MS = 60 * 60 * 1000;
 
 interface DeclaredArtifactManifestEntry {
   path?: string | null;
@@ -76,6 +79,111 @@ export function ensureTurnArtifactDirectories(context: TurnArtifactContext | nul
   }
   fs.mkdirSync(context.artifactDir, { recursive: true });
   fs.mkdirSync(context.spoolDir, { recursive: true });
+}
+
+// Only non-recursive rmdir, bottom-up: empty subfolders go, any folder on the path to a file stays.
+export function cleanupEmptyTurnArtifactDirectories(context: TurnArtifactContext | null | undefined): void {
+  if (!context) {
+    return;
+  }
+  removeEmptyDirectoryTree(context.artifactDir);
+  removeEmptyDirectoryTree(context.spoolDir);
+}
+
+function removeEmptyDirectoryTree(dir: string): boolean {
+  let entries: fs.Dirent[];
+  try {
+    // lstat before readdir: a folder swapped for a symlink or junction counts as content and is never followed.
+    if (!fs.lstatSync(dir).isDirectory()) {
+      return false;
+    }
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (error) {
+    return handleEmptyDirectoryCleanupError(dir, error);
+  }
+  let empty = true;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !removeEmptyDirectoryTree(path.join(dir, entry.name))) {
+      empty = false;
+    }
+  }
+  if (!empty) {
+    return false;
+  }
+  try {
+    fs.rmdirSync(dir);
+    return true;
+  } catch (error) {
+    return handleEmptyDirectoryCleanupError(dir, error);
+  }
+}
+
+function handleEmptyDirectoryCleanupError(dir: string, error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  if (code === 'ENOENT') {
+    return true;
+  }
+  if (code !== 'ENOTEMPTY' && code !== 'EEXIST') {
+    writeSequencedDebugLog('turn-artifacts', 'cleanup_empty_dir_failed', { dir, code: code ?? null });
+  }
+  return false;
+}
+
+// Startup sweep for folders that per-turn cleanup never saw (older turns, crashes).
+// Turns store folders under their writable cwd, else home, so visit home plus every known cwd.
+// Direct subfolders only, rmdir only; the age limit keeps a running turn's fresh folder.
+export function sweepStaleEmptyTurnArtifactDirectories({
+  cwds = [],
+  homeDir = os.homedir(),
+  minAgeMs = STALE_EMPTY_TURN_ARTIFACT_DIR_AGE_MS,
+  now = Date.now(),
+}: {
+  cwds?: Array<string | null | undefined>;
+  homeDir?: string;
+  minAgeMs?: number;
+  now?: number;
+} = {}): number {
+  const baseDirs = new Set(
+    [homeDir, ...cwds]
+      .map((dir) => String(dir ?? '').trim())
+      .filter(Boolean)
+      .map((dir) => path.resolve(dir)),
+  );
+  let removedCount = 0;
+  for (const baseDir of baseDirs) {
+    removedCount += sweepStaleEmptyTurnArtifactRoots(baseDir, minAgeMs, now);
+  }
+  return removedCount;
+}
+
+function sweepStaleEmptyTurnArtifactRoots(baseDir: string, minAgeMs: number, now: number): number {
+  let removedCount = 0;
+  for (const rootName of TURN_ARTIFACT_ROOT_NAMES) {
+    const rootDir = path.join(baseDir, '.codexbridge', rootName);
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(rootDir, { withFileTypes: true });
+    } catch (error) {
+      handleEmptyDirectoryCleanupError(rootDir, error);
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const dir = path.join(rootDir, entry.name);
+      try {
+        if (now - fs.lstatSync(dir).mtimeMs < minAgeMs) {
+          continue;
+        }
+        fs.rmdirSync(dir);
+        removedCount += 1;
+      } catch (error) {
+        handleEmptyDirectoryCleanupError(dir, error);
+      }
+    }
+  }
+  return removedCount;
 }
 
 export function createPendingTurnArtifactDeliveryState(

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 
 const distTestDir = path.join(process.cwd(), 'dist', 'test');
 fs.rmSync(distTestDir, { recursive: true, force: true });
@@ -13,6 +14,15 @@ const isolatedEnv = { ...process.env };
 isolatedEnv[AGENT_COMMAND_ENV_FLAG] ??= '1';
 const allowLiveAgent = isolatedEnv[LIVE_AGENT_TEST_ENV_FLAG] === '1';
 const allowLiveOpenAICompatible = isolatedEnv[LIVE_OPENAI_COMPATIBLE_TEST_ENV_FLAG] === '1';
+
+if (!allowLiveAgent) {
+  // BridgeCoordinator routes side tasks to the native API, default 127.0.0.1:43182.
+  // On a machine running the real bridge, each test would start a real Codex thread
+  // that keeps its MCP servers and node_repl alive.
+  isolatedEnv.CODEX_NATIVE_API_ENABLE = '0';
+  delete isolatedEnv.CODEXBRIDGE_INTERNAL_NATIVE_API_ENABLED;
+  delete isolatedEnv.CODEXBRIDGE_INTERNAL_NATIVE_API_BASE_URL;
+}
 
 if (!allowLiveAgent && !allowLiveOpenAICompatible) {
   for (const key of [
@@ -73,16 +83,30 @@ const testArgs =
       ? importedEntryArgs
       : collectTestFiles(path.join(process.cwd(), 'test'));
 
-const result = spawnSync(process.execPath, ['--import', 'tsx', '--test', ...testArgs], {
+// Run in CI's time zone and a throwaway home, so results do not depend on
+// this machine and turn artifacts never land in the real ~/.codexbridge.
+const testHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-test-'));
+isolatedEnv.TZ = 'UTC';
+isolatedEnv.HOME = testHome;
+isolatedEnv.USERPROFILE = testHome;
+
+const child = spawn(process.execPath, ['--import', 'tsx', '--test', ...testArgs], {
   env: isolatedEnv,
   stdio: 'inherit',
 });
-
-if (typeof result.status === 'number') {
-  process.exit(result.status);
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => child.kill(signal));
 }
+child.on('error', (error) => {
+  console.error(error);
+  finish(1);
+});
+child.on('exit', (code) => finish(typeof code === 'number' ? code : 1));
 
-process.exit(1);
+function finish(code) {
+  fs.rmSync(testHome, { recursive: true, force: true });
+  process.exit(code);
+}
 
 function loadOptionalEnvFile(filePath) {
   if (!filePath) {

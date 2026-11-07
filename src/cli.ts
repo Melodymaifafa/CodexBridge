@@ -20,6 +20,13 @@ import { OpenAINativeProviderPlugin } from './providers/openai_native/plugin.js'
 import { OpenAICompatibleProviderPlugin } from './providers/openai_compatible/plugin.js';
 import { WeixinBridgeRuntime } from './runtime/weixin_bridge_runtime.js';
 import { createI18n } from './i18n/index.js';
+import {
+  captureProcessWarningsInSequencedStderr,
+  flushSequencedStderr,
+  flushSequencedStderrOnExit,
+  writeSequencedStderrError,
+} from './core/sequenced_stderr.js';
+import { sweepStaleEmptyTurnArtifactDirectories } from './core/turn_artifacts.js';
 
 const CLI_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(CLI_FILE), '..');
@@ -413,6 +420,8 @@ async function runWeixinSend(
 }
 
 async function runWeixinServe(args: string[]) {
+  captureProcessWarningsInSequencedStderr();
+  flushSequencedStderrOnExit();
   const i18n = createI18n();
   const options = parseWeixinServeArgs(args);
   const stateDir = path.resolve(options.stateDir ?? defaultCodexBridgeStateDir());
@@ -454,7 +463,7 @@ async function runWeixinServe(args: string[]) {
     agentJobs: runtime.services.agentJobs,
     assistantRecords: runtime.services.assistantRecords,
     onError: (async (error: unknown) => {
-      process.stderr.write(`[weixin] ${formatError(error)}\n`);
+      writeSequencedStderrError('[weixin]', error);
     }) as any,
     locale: i18n.locale,
   } as any);
@@ -486,6 +495,15 @@ async function runWeixinServe(args: string[]) {
   process.stdout.write(`serve_lock: ${serveLock.lockPath}\n`);
   process.stdout.write(`${i18n.t('cli.serve.defaultCwd', { value: runtime.config.defaultCwd ?? i18n.t('common.none') })}\n`);
   process.stdout.write(`native_api_enabled: ${nativeApi ? 'true' : 'false'}\n`);
+  const staleEmptyArtifactDirsRemoved = sweepStaleEmptyTurnArtifactDirectories({
+    cwds: [
+      defaultCwd,
+      ...repositories.bridgeSessions.list().map((session) => session.cwd),
+      ...repositories.automationJobs.list().map((job) => job.cwd),
+      ...repositories.agentJobs.list().map((job) => job.cwd),
+    ],
+  });
+  process.stdout.write(`stale_empty_artifact_dirs_removed: ${staleEmptyArtifactDirsRemoved}\n`);
 
   let stopped = false;
   process.once('exit', () => {
@@ -496,6 +514,8 @@ async function runWeixinServe(args: string[]) {
       return;
     }
     stopped = true;
+    // Errors raised by the shutdown awaits below are written by the exit flush.
+    flushSequencedStderr();
     process.stdout.write(`${i18n.t('cli.serve.stopping', { signal })}\n`);
     try {
       await bridgeRuntime.stop();
@@ -1360,13 +1380,6 @@ function createWeixinServeCodexGoalManager(stateDir: string) {
 
 async function stopRuntimeProviderPlugins(providerPlugins: any[]) {
   await Promise.allSettled(providerPlugins.map((plugin) => plugin?.stop?.()));
-}
-
-function formatError(error: unknown) {
-  if (error instanceof Error) {
-    return error.stack || error.message;
-  }
-  return String(error);
 }
 
 function normalizeCliString(value: unknown): string | null {

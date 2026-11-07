@@ -481,6 +481,10 @@ export interface ProviderPluginContract {
     providerProfile: ProviderProfile;
     threadId: string;
   }): Promise<void>;
+  unsubscribeThread?(params: {
+    providerProfile: ProviderProfile;
+    threadId: string;
+  }): Promise<void>;
   startTurn(params: {
     providerProfile: ProviderProfile;
     bridgeSession: ProviderTurnSession;

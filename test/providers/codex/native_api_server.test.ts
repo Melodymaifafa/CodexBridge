@@ -1148,3 +1148,120 @@ test('CodexNativeApiServer enforces optional bearer auth on localhost routes', a
     await server.stop();
   }
 });
+
+test('CodexNativeApiServer keeps a /v1/responses thread loaded until its continuation expires and unloads one-shot threads at once', async () => {
+  let now = 700_000;
+  let nextResponseId = 'resp_retain_1';
+  let threadCount = 0;
+  const unsubscribed: string[] = [];
+  const runtime = new CodexNativeRuntime({
+    now: () => now,
+    readAccountIdentity: () => ({
+      email: 'native@example.com',
+      name: 'Native Runtime',
+      authMode: 'chatgpt',
+      accountId: 'acc_native',
+      plan: 'plus',
+      authPath: '/tmp/auth.json',
+    }),
+  });
+  const providerPlugin = {
+    async listModels() {
+      return [{ id: 'gpt-5.5', model: 'gpt-5.5', displayName: 'GPT-5.5', isDefault: true }];
+    },
+    async startThread(params: any) {
+      threadCount += 1;
+      return { threadId: `thread-retain-${threadCount}`, cwd: params.cwd, title: params.title };
+    },
+    async startTurn(params: any) {
+      return { outputText: 'answer', previewText: '', threadId: params.bridgeSession.codexThreadId, turnId: 'turn-retain' };
+    },
+    async unsubscribeThread({ threadId }: { threadId: string }) {
+      unsubscribed.push(threadId);
+    },
+  } as any;
+  const server = new CodexNativeApiServer({
+    runtime,
+    resolveRuntimeContext: () => ({ providerProfile: makeProfile(), providerPlugin }),
+    now: () => now,
+    continuationTtlMs: 1_000,
+    createResponseId: () => nextResponseId,
+  });
+  const post = async (path: string, body: Record<string, unknown>) => {
+    const response = await fetch(`${server.baseUrl}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    assert.equal(response.status, 200);
+    return response.json() as Promise<any>;
+  };
+  await server.start();
+  try {
+    await post('/v1/responses', { input: 'First request' });
+    assert.deepEqual(unsubscribed, []);
+
+    now += 500;
+    nextResponseId = 'resp_retain_2';
+    const followup = await post('/v1/responses', { input: 'Follow-up', previous_response_id: 'resp_retain_1' });
+    assert.equal(followup.native_runtime.thread_id, 'thread-retain-1');
+    assert.deepEqual(unsubscribed, []);
+
+    nextResponseId = 'resp_retain_3';
+    await post('/v1/responses', { input: 'One shot', store: false });
+    assert.deepEqual(unsubscribed, ['thread-retain-2']);
+
+    await post('/v1/chat/completions', { messages: [{ role: 'user', content: 'One shot chat' }] });
+    assert.deepEqual(unsubscribed, ['thread-retain-2', 'thread-retain-3']);
+
+    now += 2_000;
+    nextResponseId = 'resp_retain_4';
+    await post('/v1/responses', { input: 'After expiry', store: false });
+    assert.deepEqual(unsubscribed, ['thread-retain-2', 'thread-retain-3', 'thread-retain-1', 'thread-retain-4']);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('CodexNativeApiServer stop unloads the threads it still retains', async () => {
+  const unsubscribed: string[] = [];
+  const runtime = new CodexNativeRuntime({
+    readAccountIdentity: () => ({
+      email: 'native@example.com',
+      name: 'Native Runtime',
+      authMode: 'chatgpt',
+      accountId: 'acc_native',
+      plan: 'plus',
+      authPath: '/tmp/auth.json',
+    }),
+  });
+  const providerPlugin = {
+    async listModels() {
+      return [{ id: 'gpt-5.5', model: 'gpt-5.5', displayName: 'GPT-5.5', isDefault: true }];
+    },
+    async startThread(params: any) {
+      return { threadId: 'thread-retain-stop', cwd: params.cwd, title: params.title };
+    },
+    async startTurn(params: any) {
+      return { outputText: 'answer', previewText: '', threadId: params.bridgeSession.codexThreadId };
+    },
+    async unsubscribeThread({ threadId }: { threadId: string }) {
+      unsubscribed.push(threadId);
+    },
+  } as any;
+  const server = new CodexNativeApiServer({
+    runtime,
+    resolveRuntimeContext: () => ({ providerProfile: makeProfile(), providerPlugin }),
+  });
+  await server.start();
+  const response = await fetch(`${server.baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ input: 'Keep me for a continuation', stream: true }),
+  });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.deepEqual(unsubscribed, []);
+  await server.stop();
+  assert.deepEqual(unsubscribed, ['thread-retain-stop']);
+});

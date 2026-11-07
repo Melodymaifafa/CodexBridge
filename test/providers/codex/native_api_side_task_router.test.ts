@@ -84,6 +84,9 @@ test('CodexNativeApiSideTaskRouter routes eligible tasks through the localhost n
         turnId: 'turn-native-api-router-1',
       };
     },
+    async unsubscribeThread(params: any) {
+      calls.push({ kind: 'unsubscribeThread', payload: params });
+    },
   } as any;
   const server = new CodexNativeApiServer({
     runtime,
@@ -135,6 +138,9 @@ test('CodexNativeApiSideTaskRouter routes eligible tasks through the localhost n
       subcommand: 'search',
       operation: 'search',
     });
+    // Side tasks send store: false, so the server unloads the thread right after answering.
+    assert.equal(calls[3]?.kind, 'unsubscribeThread');
+    assert.equal(calls[3]?.payload.threadId, 'thread-native-api-router-1');
   } finally {
     await server.stop();
   }

@@ -93,6 +93,9 @@ export interface CodexNativeRuntimeRunTurnOptions extends CodexNativeRuntimeTurn
   model?: string | null;
   reasoningEffort?: string | null;
   serviceTier?: string | null;
+  // Keep the thread loaded after a successful turn; the caller then owns releaseThread().
+  // A failed turn always releases it.
+  retainThread?: boolean;
   prepareTurn: (session: CodexNativeSession) => CodexNativeRuntimeTurnPreparation;
 }
 
@@ -267,6 +270,7 @@ export class CodexNativeRuntime {
     model = null,
     reasoningEffort = null,
     serviceTier = null,
+    retainThread = false,
     prepareTurn,
     onProgress = null,
     onTurnStarted = null,
@@ -279,17 +283,47 @@ export class CodexNativeRuntime {
       title,
       metadata,
     });
-    return this.runTurnOnSession({
-      providerProfile,
-      providerPlugin,
-      session,
-      model,
-      reasoningEffort,
-      serviceTier,
-      prepareTurn,
-      onProgress,
-      onTurnStarted,
-    });
+    let retained = false;
+    try {
+      const execution = await this.runTurnOnSession({
+        providerProfile,
+        providerPlugin,
+        session,
+        model,
+        reasoningEffort,
+        serviceTier,
+        prepareTurn,
+        onProgress,
+        onTurnStarted,
+      });
+      retained = retainThread;
+      return execution;
+    } finally {
+      if (!retained) {
+        await this.releaseThread({ providerProfile, providerPlugin, threadId: session.codexThreadId });
+      }
+    }
+  }
+
+  // The app-server keeps every subscribed thread loaded, with its MCP servers and node_repl.
+  // Unsubscribing lets it unload the thread. Best effort: the request already has its answer.
+  async releaseThread({
+    providerProfile,
+    providerPlugin,
+    threadId,
+  }: {
+    providerProfile: ProviderProfile;
+    providerPlugin: ProviderPluginContract | null | undefined;
+    threadId: string | null | undefined;
+  }): Promise<void> {
+    if (!threadId || typeof providerPlugin?.unsubscribeThread !== 'function') {
+      return;
+    }
+    try {
+      await providerPlugin.unsubscribeThread({ providerProfile, threadId });
+    } catch {
+      // Ignore: the thread stays loaded until the bridge restarts, as it did before.
+    }
   }
 
   async continueIsolatedTurn({

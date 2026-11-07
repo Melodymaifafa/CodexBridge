@@ -168,6 +168,17 @@ export class DefaultCodexNativeProviderPlugin implements ProviderPluginContract 
     return client.listThreads({ limit, cursor, searchTerm, archived: Boolean(archived) });
   }
 
+  async unsubscribeThread({
+    providerProfile,
+    threadId,
+  }: {
+    providerProfile: ProviderProfile;
+    threadId: string;
+  }): Promise<void> {
+    const client = await this.ensureClient(providerProfile);
+    await client.unsubscribeThread(threadId);
+  }
+
   async startTurn({
     providerProfile,
     bridgeSession,

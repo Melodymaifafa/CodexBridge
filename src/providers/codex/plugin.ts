@@ -266,6 +266,17 @@ export class CodexProviderPlugin {
     await client.unarchiveThread(threadId);
   }
 
+  async unsubscribeThread({
+    providerProfile,
+    threadId,
+  }: {
+    providerProfile: ProviderProfile;
+    threadId: string;
+  }): Promise<void> {
+    const client = await this.ensureClient(providerProfile);
+    await client.unsubscribeThread(threadId);
+  }
+
   async resumeThread({
     providerProfile,
     threadId,
